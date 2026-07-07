@@ -1,0 +1,11 @@
+# Local runtime / working files
+*.log
+cereus_datasync.log
+
+# Ad-hoc test scaffolding
+test_phpbin.php
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

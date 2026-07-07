@@ -1,0 +1,128 @@
+/* Cereus Data Sync — Plugin Styles */
+
+/* ── Links — replace linkOverDark (which is white in Cacti's modern theme) ─── */
+
+.cds-link,
+.cds-link:visited {
+    color: #0369a1;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+}
+.cds-link:hover {
+    color: #1d4ed8;
+    text-decoration: underline;
+}
+.cds-link-danger,
+.cds-link-danger:visited {
+    color: #dc2626;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+}
+.cds-link-danger:hover {
+    color: #991b1b;
+    text-decoration: underline;
+}
+
+/* ── Profile list ──────────────────────────────────────────────────────────── */
+
+.cds-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    vertical-align: middle;
+}
+
+.cds-btn-run {
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: 600;
+    color: #15803d;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #f0fdf4;
+    border: 1px solid #bbf7d0;
+    transition: background .15s;
+}
+
+.cds-btn-run:hover {
+    background: #dcfce7;
+}
+
+/* ── Run modal ────────────────────────────────────────────────────────────── */
+
+#cds-run-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .5);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+}
+
+#cds-run-modal.active {
+    display: flex;
+}
+
+#cds-run-modal > div {
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px 32px;
+    min-width: 340px;
+    max-width: 520px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, .2);
+}
+
+/* ── Column map table ─────────────────────────────────────────────────────── */
+
+#cds-func-table input[type="text"],
+#cds-func-table select {
+    font-size: 12px;
+}
+
+/* ── Rules table ──────────────────────────────────────────────────────────── */
+
+#cds-rules-table {
+    border-collapse: collapse;
+}
+
+#cds-rules-table th,
+#cds-rules-table td {
+    border-bottom: 1px solid #e5e7eb;
+}
+
+#cds-rules-table tbody tr:hover {
+    background: #f8fafc;
+}
+
+#cds-rules-tbody tr.ui-sortable-helper {
+    background: #eff6ff;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, .12);
+}
+
+#cds-rules-table input[type="text"],
+#cds-rules-table select {
+    font-size: 12px;
+    min-width: 90px;
+}
+
+/* ── Stat cards in run detail ────────────────────────────────────────────── */
+
+.cds-stat-card {
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+}
+
+/* ── License wall ─────────────────────────────────────────────────────────── */
+
+.cds-license-wall {
+    text-align: center;
+    padding: 32px;
+}

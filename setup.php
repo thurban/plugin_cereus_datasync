@@ -20,6 +20,7 @@ function plugin_cereus_datasync_uninstall() {
     db_execute('DROP TABLE IF EXISTS plugin_cds_runs');
     db_execute('DROP TABLE IF EXISTS plugin_cds_rule_conditions');
     db_execute('DROP TABLE IF EXISTS plugin_cds_tree_rules');
+    db_execute('DROP TABLE IF EXISTS plugin_cds_agg_conditions');
     db_execute('DROP TABLE IF EXISTS plugin_cds_aggregate_rules');
     db_execute('DROP TABLE IF EXISTS plugin_cds_oid_rules');
     db_execute('DROP TABLE IF EXISTS plugin_cds_function_maps');
@@ -322,6 +323,47 @@ function cereus_datasync_setup_tables() {
     if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_aggregate_rules LIKE 'device_match_pattern2'"))) {
         db_execute("ALTER TABLE plugin_cds_aggregate_rules
             ADD COLUMN device_match_pattern2 VARCHAR(256) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER device_match_field2");
+    }
+
+    // Aggregate rule device-match conditions — unbounded N-condition list with the same
+    // AND/OR + parenthesis grammar as tree-rule conditions, superseding the fixed
+    // primary/secondary (device_match_field/field2 + condition_logic) columns. Those legacy
+    // columns are retained but no longer read; the one-time block below migrates their data.
+    $aggCondNew = !cacti_sizeof(db_fetch_assoc("SHOW TABLES LIKE 'plugin_cds_agg_conditions'"));
+    db_execute("CREATE TABLE IF NOT EXISTS plugin_cds_agg_conditions (
+        id          INT UNSIGNED      NOT NULL AUTO_INCREMENT,
+        agg_rule_id INT UNSIGNED      NOT NULL,
+        sequence    SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+        connector   CHAR(3)           NOT NULL DEFAULT 'AND',
+        open_paren  TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+        close_paren TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+        field       VARCHAR(32)       NOT NULL DEFAULT 'description',
+        operator    TINYINT UNSIGNED  NOT NULL DEFAULT 1,
+        pattern     VARCHAR(256)      NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
+        PRIMARY KEY (id),
+        INDEX idx_agg_rule (agg_rule_id)
+    ) $charset");
+
+    if ($aggCondNew) {
+        // Migrate the legacy primary/secondary conditions into the new list (operator 1 = contains).
+        $legacy = db_fetch_assoc("SELECT * FROM plugin_cds_aggregate_rules WHERE device_match_field <> ''");
+        if (cacti_sizeof($legacy)) {
+            foreach ($legacy as $r) {
+                db_execute_prepared(
+                    "INSERT INTO plugin_cds_agg_conditions (agg_rule_id, sequence, connector, open_paren, close_paren, field, operator, pattern)
+                     VALUES (?, 1, 'AND', 0, 0, ?, 1, ?)",
+                    [(int)$r['id'], $r['device_match_field'], $r['device_match_pattern']]
+                );
+                if (trim($r['device_match_field2'] ?? '') !== '') {
+                    $conn = (strtoupper($r['condition_logic'] ?? 'AND') === 'OR') ? 'OR' : 'AND';
+                    db_execute_prepared(
+                        "INSERT INTO plugin_cds_agg_conditions (agg_rule_id, sequence, connector, open_paren, close_paren, field, operator, pattern)
+                         VALUES (?, 2, ?, 0, 0, ?, 1, ?)",
+                        [(int)$r['id'], $conn, $r['device_match_field2'], $r['device_match_pattern2'] ?? '']
+                    );
+                }
+            }
+        }
     }
 
     // Migration: add auto-graph-rules columns to existing installs

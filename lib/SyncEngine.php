@@ -437,8 +437,6 @@ class CereusDatasyncEngine {
             $treeId          = (int)$rule['tree_id'];
             $treeItemId      = (int)$rule['tree_item_id'];
             $aggTemplateId   = (int)$rule['aggregate_template_id'];
-            $matchField      = trim($rule['device_match_field']);
-            $matchPattern    = trim($rule['device_match_pattern']);
             $titlePattern    = trim($rule['graph_title_pattern'] ?? '');
 
             if (!$graphTemplateId || !$treeId) {
@@ -447,35 +445,35 @@ class CereusDatasyncEngine {
                 continue;
             }
 
-            // Collect member graph IDs with optional device-field and graph-title filters.
-            // Always JOIN graph_templates_graph so the title filter can apply without a
-            // second query; the JOIN is cheap (indexed on local_graph_id).
-            $useDeviceFilter = $matchField && $matchPattern && isset($fieldMap[$matchField]);
-            $useTitleFilter  = $titlePattern !== '';
+            // Build the device-match WHERE clause from the rule's condition list (AND/OR +
+            // parentheses). No conditions → match every graph of the template. Always JOIN
+            // graph_templates_graph so the title filter can apply without a second query; the
+            // JOIN is cheap (indexed on local_graph_id).
+            $useTitleFilter = $titlePattern !== '';
 
-            $condLogic   = (strtoupper(trim($rule['condition_logic'] ?? 'AND')) === 'OR') ? 'OR' : 'AND';
-            $matchField2 = trim($rule['device_match_field2'] ?? '');
-            $matchPat2   = trim($rule['device_match_pattern2'] ?? '');
-            $useSecond   = $useDeviceFilter && $matchField2 && $matchPat2 && isset($fieldMap[$matchField2]);
+            $conds = db_fetch_assoc_prepared(
+                'SELECT * FROM plugin_cds_agg_conditions WHERE agg_rule_id = ? ORDER BY sequence, id',
+                [(int)$rule['id']]
+            );
 
-            if ($useDeviceFilter) {
-                $dbField = $fieldMap[$matchField];
-                if ($useSecond) {
-                    $dbField2 = $fieldMap[$matchField2];
-                    $sql    = "SELECT gl.id FROM graph_local gl
-                               INNER JOIN host h ON h.id = gl.host_id
-                               INNER JOIN graph_templates_graph gtg ON gtg.local_graph_id = gl.id
-                               WHERE gl.graph_template_id = ?
-                                 AND ($dbField LIKE ? $condLogic $dbField2 LIKE ?)";
-                    $params = [$graphTemplateId, '%' . $matchPattern . '%', '%' . $matchPat2 . '%'];
-                } else {
-                    $sql    = "SELECT gl.id FROM graph_local gl
-                               INNER JOIN host h ON h.id = gl.host_id
-                               INNER JOIN graph_templates_graph gtg ON gtg.local_graph_id = gl.id
-                               WHERE gl.graph_template_id = ?
-                                 AND $dbField LIKE ?";
-                    $params = [$graphTemplateId, '%' . $matchPattern . '%'];
-                }
+            $whereParams = [];
+            try {
+                $whereClause = $this->buildAggConditionWhere(
+                    cacti_sizeof($conds) ? $conds : [], $fieldMap, $whereParams
+                );
+            } catch (\Throwable $e) {
+                $this->logDetail('agg_skip', '', '', null,
+                    'Rule "' . $rule['name'] . '": ' . $e->getMessage());
+                continue;
+            }
+
+            if ($whereClause !== null) {
+                $sql    = "SELECT gl.id FROM graph_local gl
+                           INNER JOIN host h ON h.id = gl.host_id
+                           INNER JOIN graph_templates_graph gtg ON gtg.local_graph_id = gl.id
+                           WHERE gl.graph_template_id = ?
+                             AND ($whereClause)";
+                $params = array_merge([$graphTemplateId], $whereParams);
             } else {
                 $sql    = 'SELECT gl.id FROM graph_local gl
                            INNER JOIN graph_templates_graph gtg ON gtg.local_graph_id = gl.id
@@ -597,6 +595,60 @@ class CereusDatasyncEngine {
                 'Rule "' . $rule['name'] . '" graph_id=' . $resultGraphId
                 . ' members=' . count($memberGraphIds));
         }
+    }
+
+    /**
+     * Assemble a parameterised SQL WHERE fragment from an aggregate rule's device-match
+     * conditions. Each condition contributes "<field> <op> ?" wrapped in its opening/closing
+     * parentheses and joined to the previous one with its AND/OR connector, e.g.
+     *   h.description LIKE ? AND ( h.location LIKE ? OR h.location LIKE ? )
+     * Field names come from the $fieldMap whitelist and operators from a fixed table, so the
+     * only user-supplied SQL is the bound "?" pattern — no injection surface. Returns null when
+     * there are no usable conditions (caller then matches all graphs of the template). Throws on
+     * unbalanced parentheses so the caller can skip the rule rather than emit malformed SQL.
+     */
+    private function buildAggConditionWhere(array $conds, array $fieldMap, array &$params): ?string {
+        // operator code => [sql operator, pattern prefix, pattern suffix]
+        $opMap = [
+            1 => ['LIKE',     '%', '%'],   // contains
+            2 => ['NOT LIKE', '%', '%'],   // does not contain
+            3 => ['LIKE',     '',  '%'],   // begins with
+            5 => ['LIKE',     '%', ''],    // ends with
+            7 => ['=',        '',  ''],    // equals (exact)
+        ];
+
+        $sql     = '';
+        $first   = true;
+        $balance = 0;
+
+        foreach ($conds as $c) {
+            $field = $fieldMap[$c['field']] ?? null;
+            if ($field === null) continue; // unknown field (shouldn't happen — validated on save)
+
+            $op    = $opMap[(int)$c['operator']] ?? $opMap[1];
+            $open  = max(0, (int)($c['open_paren']  ?? 0));
+            $close = max(0, (int)($c['close_paren'] ?? 0));
+            $conn  = (strtoupper($c['connector'] ?? 'AND') === 'OR') ? 'OR' : 'AND';
+
+            if (!$first) {
+                $sql .= " $conn ";
+            }
+            $sql     .= str_repeat('(', $open) . " $field {$op[0]} ? " . str_repeat(')', $close);
+            $params[] = $op[1] . trim($c['pattern']) . $op[2];
+            $balance += $open - $close;
+            $first    = false;
+        }
+
+        if ($sql === '') {
+            $params = [];
+            return null;
+        }
+        if ($balance !== 0) {
+            $params = [];
+            throw new \RuntimeException('unbalanced parentheses in device match conditions');
+        }
+
+        return trim($sql);
     }
 
     // ─── OID graph rule application ───────────────────────────────────────────

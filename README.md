@@ -19,7 +19,9 @@ A commercial [Cereus](https://urban-software.de) plugin for
   full boolean grouping (**AND**/**OR** connectors with parentheses) and
   location placeholders (`{site_id}`, `{site}`, `{region}`, `{country}`).
 - **Aggregate graph rules** — build/rebuild aggregate graphs from all member
-  graphs matching a graph template, device field filter, and title filter.
+  graphs matching a graph template, an unbounded list of device match
+  conditions (**AND**/**OR** connectors with parenthesis grouping), and an
+  optional graph title filter.
 - **OID graph rules** — create graphs from SNMP generic-OID templates for
   matching devices.
 - **Sync log** — full audit log of every run with per-device detail and CSV

@@ -144,9 +144,10 @@ function cereus_datasync_copy_profile(int $id): int {
             db_execute_prepared(
                 'INSERT INTO plugin_cds_aggregate_rules
                     (profile_id, rule_order, enabled, name, graph_template_id, aggregate_template_id,
-                     tree_id, tree_item_id, device_match_field, device_match_pattern,
+                     tree_id, tree_item_id, placement_mode, site_name,
+                     device_match_field, device_match_pattern,
                      graph_title_pattern, result_graph_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                 [
                     $newId,
                     (int)$ar['rule_order'],
@@ -156,11 +157,31 @@ function cereus_datasync_copy_profile(int $id): int {
                     (int)$ar['aggregate_template_id'],
                     (int)$ar['tree_id'],
                     (int)$ar['tree_item_id'],
+                    (int)($ar['placement_mode'] ?? 0),
+                    $ar['site_name'] ?? '',
                     $ar['device_match_field'],
                     $ar['device_match_pattern'],
                     $ar['graph_title_pattern'] ?? '',
                 ]
             );
+            $newAggId = (int)db_fetch_insert_id();
+
+            $aggConds = db_fetch_assoc_prepared(
+                'SELECT * FROM plugin_cds_agg_conditions WHERE agg_rule_id = ? ORDER BY sequence, id',
+                [(int)$ar['id']]
+            );
+            if (cacti_sizeof($aggConds)) {
+                foreach ($aggConds as $c) {
+                    db_execute_prepared(
+                        'INSERT INTO plugin_cds_agg_conditions (agg_rule_id, sequence, connector, open_paren, close_paren, field, operator, pattern)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        [$newAggId, (int)$c['sequence'],
+                         (strtoupper($c['connector'] ?? 'AND') === 'OR' ? 'OR' : 'AND'),
+                         (int)($c['open_paren'] ?? 0), (int)($c['close_paren'] ?? 0),
+                         $c['field'], (int)$c['operator'], $c['pattern']]
+                    );
+                }
+            }
         }
     }
 
@@ -264,7 +285,23 @@ function cereus_datasync_get_agg_rules(int $profileId): array {
     return cacti_sizeof($rows) ? $rows : [];
 }
 
+function cereus_datasync_get_agg_conditions(int $aggRuleId): array {
+    $rows = db_fetch_assoc_prepared(
+        'SELECT * FROM plugin_cds_agg_conditions WHERE agg_rule_id = ? ORDER BY sequence, id',
+        [$aggRuleId]
+    );
+    return cacti_sizeof($rows) ? $rows : [];
+}
+
 function cereus_datasync_delete_agg_rule(int $ruleId, int $profileId): void {
+    // Only cascade the conditions if the rule actually belongs to this profile.
+    $owns = db_fetch_cell_prepared(
+        'SELECT id FROM plugin_cds_aggregate_rules WHERE id = ? AND profile_id = ?',
+        [$ruleId, $profileId]
+    );
+    if ($owns) {
+        db_execute_prepared('DELETE FROM plugin_cds_agg_conditions WHERE agg_rule_id = ?', [$ruleId]);
+    }
     db_execute_prepared(
         'DELETE FROM plugin_cds_aggregate_rules WHERE id = ? AND profile_id = ?',
         [$ruleId, $profileId]

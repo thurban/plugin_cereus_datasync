@@ -344,21 +344,14 @@ switch ($action) {
         $pid    = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
         if (!$ruleId || !$pid) { print json_encode(['error' => 'Missing params']); exit; }
 
-        $allowedMatchFields = ['', 'description', 'hostname', 'location'];
-        $matchField = get_nfilter_request_var('device_match_field', '');
-        if (!in_array($matchField, $allowedMatchFields, true)) $matchField = '';
-        $matchField2 = get_nfilter_request_var('device_match_field2', '');
-        if (!in_array($matchField2, $allowedMatchFields, true)) $matchField2 = '';
-        $condLogicRaw = strtoupper(trim(get_nfilter_request_var('condition_logic', 'AND')));
-        $condLogic = ($condLogicRaw === 'OR') ? 'OR' : 'AND';
         $pmode = ((int)get_filter_request_var('placement_mode', FILTER_VALIDATE_INT) === 1) ? 1 : 0;
 
+        // Device match conditions now live in plugin_cds_agg_conditions (add/update/delete_agg_condition),
+        // so this handler only persists the rule-level fields.
         db_execute_prepared(
             'UPDATE plugin_cds_aggregate_rules
              SET name = ?, graph_template_id = ?, aggregate_template_id = ?,
                  tree_id = ?, tree_item_id = ?, placement_mode = ?, site_name = ?,
-                 device_match_field = ?, device_match_pattern = ?,
-                 condition_logic = ?, device_match_field2 = ?, device_match_pattern2 = ?,
                  graph_title_pattern = ?, enabled = ?
              WHERE id = ? AND profile_id = ?',
             [
@@ -369,16 +362,73 @@ switch ($action) {
                 (int)get_filter_request_var('tree_item_id', FILTER_VALIDATE_INT),
                 $pmode,
                 substr(trim(get_nfilter_request_var('site_name', '')), 0, 128),
-                $matchField,
-                substr(trim(get_nfilter_request_var('device_match_pattern', '')), 0, 256),
-                $condLogic,
-                $matchField2,
-                substr(trim(get_nfilter_request_var('device_match_pattern2', '')), 0, 256),
                 substr(trim(get_nfilter_request_var('graph_title_pattern', '')), 0, 256),
                 (get_nfilter_request_var('enabled', '') === 'on') ? 'on' : '',
                 $ruleId, $pid,
             ]
         );
+        print json_encode(['ok' => true]);
+        break;
+    }
+
+    // POST — add a device-match condition to an aggregate rule
+    case 'add_agg_condition': {
+        $ruleId = (int)get_filter_request_var('rule_id', FILTER_VALIDATE_INT);
+        $pid    = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
+        $seq    = (int)get_filter_request_var('sequence', FILTER_VALIDATE_INT) ?: 1;
+        if (!$ruleId || !$pid) { print json_encode(['error' => 'Missing params']); exit; }
+
+        $owns = db_fetch_cell_prepared('SELECT id FROM plugin_cds_aggregate_rules WHERE id = ? AND profile_id = ?', [$ruleId, $pid]);
+        if (!$owns) { print json_encode(['error' => 'Access denied']); exit; }
+
+        db_execute_prepared(
+            'INSERT INTO plugin_cds_agg_conditions (agg_rule_id, sequence, connector, open_paren, close_paren, field, operator, pattern)
+             VALUES (?, ?, ?, 0, 0, ?, 1, ?)',
+            [$ruleId, $seq, 'AND', 'description', '']
+        );
+        print json_encode(['id' => (int)db_fetch_insert_id()]);
+        break;
+    }
+
+    // POST — update an aggregate-rule condition
+    case 'update_agg_condition': {
+        $condId = (int)get_filter_request_var('condition_id', FILTER_VALIDATE_INT);
+        $ruleId = (int)get_filter_request_var('rule_id', FILTER_VALIDATE_INT);
+        if (!$condId || !$ruleId) { print json_encode(['error' => 'Missing params']); exit; }
+
+        $allowedFields = ['description', 'hostname', 'location'];
+        $field = get_nfilter_request_var('field', 'description');
+        if (!in_array($field, $allowedFields, true)) $field = 'description';
+
+        $allowedOps = [1, 2, 3, 5, 7];
+        $operator = (int)get_filter_request_var('operator', FILTER_VALIDATE_INT);
+        if (!in_array($operator, $allowedOps, true)) $operator = 1;
+
+        $connector  = strtoupper(get_nfilter_request_var('connector', 'AND')) === 'OR' ? 'OR' : 'AND';
+        $openParen  = max(0, min(5, (int)get_filter_request_var('open_paren',  FILTER_VALIDATE_INT)));
+        $closeParen = max(0, min(5, (int)get_filter_request_var('close_paren', FILTER_VALIDATE_INT)));
+        $seq        = (int)get_filter_request_var('sequence', FILTER_VALIDATE_INT) ?: 1;
+
+        db_execute_prepared(
+            'UPDATE plugin_cds_agg_conditions
+             SET sequence = ?, connector = ?, open_paren = ?, close_paren = ?, field = ?, operator = ?, pattern = ?
+             WHERE id = ? AND agg_rule_id = ?',
+            [
+                $seq, $connector, $openParen, $closeParen, $field, $operator,
+                substr(trim(get_nfilter_request_var('pattern', '')), 0, 256),
+                $condId, $ruleId,
+            ]
+        );
+        print json_encode(['ok' => true]);
+        break;
+    }
+
+    // POST — delete an aggregate-rule condition
+    case 'delete_agg_condition': {
+        $condId = (int)get_filter_request_var('condition_id', FILTER_VALIDATE_INT);
+        $ruleId = (int)get_filter_request_var('rule_id', FILTER_VALIDATE_INT);
+        if (!$condId || !$ruleId) { print json_encode(['error' => 'Missing params']); exit; }
+        db_execute_prepared('DELETE FROM plugin_cds_agg_conditions WHERE id = ? AND agg_rule_id = ?', [$condId, $ruleId]);
         print json_encode(['ok' => true]);
         break;
     }

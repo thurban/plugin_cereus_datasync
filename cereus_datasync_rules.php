@@ -391,11 +391,19 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
     $trees      = cereus_datasync_get_trees_array();
     $gTpls      = cereus_datasync_get_graph_templates_array();
     $aTpls      = cereus_datasync_get_aggregate_templates_array();
-    $matchFields = [
-        ''            => __('— All devices —', 'cereus_datasync'),
+    // Fields available to device-match conditions (no "all devices" entry — matching all
+    // devices is expressed by having zero conditions).
+    $condFields = [
         'description' => __('Device Description', 'cereus_datasync'),
         'hostname'    => __('Hostname / IP', 'cereus_datasync'),
         'location'    => __('Location', 'cereus_datasync'),
+    ];
+    $operators = [
+        1 => __('contains', 'cereus_datasync'),
+        2 => __('does not contain', 'cereus_datasync'),
+        3 => __('begins with', 'cereus_datasync'),
+        5 => __('ends with', 'cereus_datasync'),
+        7 => __('equals (exact match)', 'cereus_datasync'),
     ];
 
     cereus_datasync_tab_bar($profileId, 'aggregate');
@@ -405,7 +413,9 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
         '100%', '', '3', 'center', ''
     );
     print '<tr><td style="padding:8px 15px;background:#f0f9ff;border-bottom:1px solid #bae6fd;font-size:12px;color:#0369a1;">';
-    print __('Each rule creates (or rebuilds) one aggregate graph from all graphs matching the selected Graph Template, optional device field filter, and optional graph title filter. <strong>All member graphs must share the same Graph Template.</strong> The aggregate is rebuilt on every sync run.', 'cereus_datasync');
+    print __('Each rule creates (or rebuilds) one aggregate graph from all graphs matching the selected Graph Template, the device match conditions, and an optional graph title filter. <strong>All member graphs must share the same Graph Template.</strong> The aggregate is rebuilt on every sync run.<br><br>'
+        . '<strong>Device match conditions:</strong> add as many as you need — each joins to the previous one with <strong>AND</strong> or <strong>OR</strong>, and the <strong>(</strong> / <strong>)</strong> columns group them, e.g. '
+        . '<code>Location contains "DC1" AND ( Description contains "core" OR Description contains "dist" )</code>. Leave the list empty to include every device using the template. Balance every <strong>(</strong> with a matching <strong>)</strong>.', 'cereus_datasync');
     print '</td></tr>';
     print '<tr class="even"><td style="padding:6px 15px;">';
     print '<a href="cereus_datasync_edit.php?action=edit&id=' . $profileId . '" class="cds-link">&laquo; ' . __('Back to Profile', 'cereus_datasync') . '</a>';
@@ -414,7 +424,7 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
 
     if (cacti_sizeof($rules)) {
         foreach ($rules as $rule) {
-            cereus_datasync_render_agg_rule_card($rule, $trees, $gTpls, $aTpls, $matchFields);
+            cereus_datasync_render_agg_rule_card($rule, $trees, $gTpls, $aTpls, $condFields, $operators);
         }
     } else {
         html_start_box('', '100%', '', '3', 'center', '');
@@ -431,7 +441,8 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
     $treesJson   = json_encode($trees);
     $gTplsJson   = json_encode($gTpls);
     $aTplsJson   = json_encode($aTpls);
-    $matchJson   = json_encode($matchFields);
+    $condFldJson = json_encode($condFields);
+    $operJson    = json_encode($operators);
     $confirmDel  = json_encode(__('Delete this aggregate rule? The aggregate graph in Cacti is NOT removed — only the rule.', 'cereus_datasync'));
     ?>
     <div id="cds-save-toast" style="display:none;position:fixed;bottom:20px;right:20px;z-index:9999;
@@ -450,7 +461,8 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
     var cdsTrees      = <?php print $treesJson; ?>;
     var cdsGTpls      = <?php print $gTplsJson; ?>;
     var cdsATpls      = <?php print $aTplsJson; ?>;
-    var cdsMatchFlds  = <?php print $matchJson; ?>;
+    var cdsAggFields  = <?php print $condFldJson; ?>;
+    var cdsAggOpers   = <?php print $operJson; ?>;
     var cdsRootLbl    = <?php print json_encode(__('(Tree Root)', 'cereus_datasync')); ?>;
     var cdsSaveTimer  = null;
     var cdsNodeXHR    = {}; // tracks in-flight loadNodes requests per rule id
@@ -487,11 +499,6 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
             tree_item_id:          $('#cds-agg-node-'    + rid).val(),
             placement_mode:        $('#cds-agg-pmode-'   + rid).val(),
             site_name:             $('#cds-agg-site-'    + rid).val(),
-            device_match_field:    $('#cds-agg-mfield-'  + rid).val(),
-            device_match_pattern:  $('#cds-agg-mpat-'    + rid).val(),
-            condition_logic:       $('#cds-agg-clogic-'  + rid).val(),
-            device_match_field2:   $('#cds-agg-mfield2-' + rid).val(),
-            device_match_pattern2: $('#cds-agg-mpat2-'   + rid).val(),
             graph_title_pattern:   $('#cds-agg-tpat-'    + rid).val(),
             enabled:               $('#cds-agg-enabled-' + rid).is(':checked') ? 'on' : '',
             __csrf_magic:          csrfMagicToken
@@ -556,6 +563,67 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
         });
     }
 
+    // ── Device match condition helpers ───────────────────────────────────────
+    function cdsAggConnSel(val) {
+        var v = (String(val).toUpperCase() === 'OR') ? 'OR' : 'AND';
+        return '<select class="cds-aggcond-conn ui-state-default ui-corner-all" style="width:100%;">'
+            + '<option value="AND"' + (v === 'AND' ? ' selected' : '') + '>AND</option>'
+            + '<option value="OR"'  + (v === 'OR'  ? ' selected' : '') + '>OR</option>'
+            + '</select>';
+    }
+
+    function cdsAggParenSel(cls, val) {
+        var glyph = (cls.indexOf('open') !== -1) ? '(' : ')';
+        var v = Math.max(0, Math.min(3, parseInt(val, 10) || 0));
+        var html = '<select class="' + cls + ' ui-state-default ui-corner-all" style="width:100%;text-align:center;">';
+        for (var i = 0; i <= 3; i++) {
+            html += '<option value="' + i + '"' + (i === v ? ' selected' : '') + '>' + (i === 0 ? '–' : glyph.repeat(i)) + '</option>';
+        }
+        return html + '</select>';
+    }
+
+    // Disable the connector on the first condition row (nothing precedes it).
+    function cdsRefreshAggConnectors(rid) {
+        $('#cds-aggcond-tbody-' + rid + ' tr[data-cid]').each(function(idx) {
+            $(this).find('.cds-aggcond-conn').prop('disabled', idx === 0);
+        });
+    }
+
+    function buildAggCondRow(rid, cond) {
+        return '<tr data-cid="' + cond.id + '" data-rid="' + rid + '">'
+            + '<td style="padding:3px 4px;">' + cdsAggConnSel(cond.connector) + '</td>'
+            + '<td style="padding:3px 2px;">' + cdsAggParenSel('cds-aggcond-open', cond.open_paren) + '</td>'
+            + '<td style="padding:3px 6px;"><select class="cds-aggcond-field ui-state-default ui-corner-all" style="width:100%;">' + buildSel(cdsAggFields, cond.field) + '</select></td>'
+            + '<td style="padding:3px 6px;"><select class="cds-aggcond-op ui-state-default ui-corner-all" style="width:100%;">' + buildSel(cdsAggOpers, cond.operator) + '</select></td>'
+            + '<td style="padding:3px 6px;"><input type="text" class="cds-aggcond-pat ui-state-default ui-corner-all" value="' + $('<div>').text(cond.pattern).html() + '" style="width:100%;font-family:monospace;"></td>'
+            + '<td style="padding:3px 2px;">' + cdsAggParenSel('cds-aggcond-close', cond.close_paren) + '</td>'
+            + '<td style="padding:3px 6px;text-align:center;"><button type="button" class="ui-button cds-del-aggcond" data-cid="' + cond.id + '" data-rid="' + rid + '" style="min-width:0;padding:2px 6px;">&#128465;</button></td>'
+            + '</tr>';
+    }
+
+    function saveAggCond(row) {
+        var cid = row.data('cid');
+        var rid = row.data('rid');
+        if (!cid || !rid) return;
+        var tbody = row.closest('tbody');
+        var seq   = tbody.find('tr[data-cid]').index(row) + 1;
+        cdsShowSaving();
+        $.post('cereus_datasync_ajax.php', {
+            action:       'update_agg_condition',
+            condition_id: cid,
+            rule_id:      rid,
+            profile_id:   cdsProfileId,
+            sequence:     seq,
+            connector:    row.find('.cds-aggcond-conn').val(),
+            open_paren:   row.find('.cds-aggcond-open').val(),
+            close_paren:  row.find('.cds-aggcond-close').val(),
+            field:        row.find('.cds-aggcond-field').val(),
+            operator:     row.find('.cds-aggcond-op').val(),
+            pattern:      row.find('.cds-aggcond-pat').val(),
+            __csrf_magic: csrfMagicToken
+        }, function() { cdsShowSaved(); }, 'json');
+    }
+
     $(function() {
         $(document).on('blur change', '.cds-agg-field', function() {
             saveAggRule($(this).data('id'));
@@ -570,18 +638,46 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
             saveAggRule(rid);
         });
 
-        $(document).on('change', '.cds-agg-mfield', function() {
+        // ── Device match conditions (AND/OR + parentheses) ───────────────────
+        $(document).on('click', '.cds-add-aggcond', function() {
             var rid   = $(this).data('id');
-            var hasF1 = $(this).val() !== '';
-            $('#cds-agg-mpat-wrap-'  + rid).toggle(hasF1);
-            $('#cds-agg-cond2-wrap-' + rid).toggle(hasF1);
-            saveAggRule(rid);
+            var tbody = $('#cds-aggcond-tbody-' + rid);
+            var seq   = tbody.find('tr[data-cid]').length + 1;
+            $.post('cereus_datasync_ajax.php', {
+                action:       'add_agg_condition',
+                rule_id:      rid,
+                profile_id:   cdsProfileId,
+                sequence:     seq,
+                __csrf_magic: csrfMagicToken
+            }, function(data) {
+                if (data.id) {
+                    $('#cds-aggcond-empty-' + rid).remove();
+                    tbody.append(buildAggCondRow(rid, {
+                        id: data.id, field: 'description', operator: 1,
+                        pattern: '', connector: 'AND', open_paren: 0, close_paren: 0
+                    }));
+                    cdsRefreshAggConnectors(rid);
+                }
+            }, 'json');
         });
 
-        $(document).on('change', '.cds-agg-mfield2', function() {
-            var rid = $(this).data('id');
-            $('#cds-agg-mpat2-wrap-' + rid).toggle($(this).val() !== '');
-            saveAggRule(rid);
+        $(document).on('click', '.cds-del-aggcond', function() {
+            var cid = $(this).data('cid');
+            var rid = $(this).data('rid');
+            $.post('cereus_datasync_ajax.php', {
+                action:       'delete_agg_condition',
+                condition_id: cid,
+                rule_id:      rid,
+                profile_id:   cdsProfileId,
+                __csrf_magic: csrfMagicToken
+            }, function() {
+                $('tr[data-cid="' + cid + '"]').remove();
+                cdsRefreshAggConnectors(rid);
+            }, 'json');
+        });
+
+        $(document).on('blur change', '.cds-aggcond-conn, .cds-aggcond-open, .cds-aggcond-close, .cds-aggcond-field, .cds-aggcond-op, .cds-aggcond-pat', function() {
+            saveAggCond($(this).closest('tr'));
         });
 
         $(document).on('click', '.cds-agg-del', function() {
@@ -612,6 +708,7 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
         // Bind tree dropdowns and load nodes for fixed-mode rules
         <?php if (cacti_sizeof($rules)): foreach ($rules as $rule): ?>
         bindAggTree(<?php print (int)$rule['id']; ?>);
+        cdsRefreshAggConnectors(<?php print (int)$rule['id']; ?>);
         <?php if ((int)($rule['placement_mode'] ?? 0) === 0): ?>
         loadNodes(<?php print (int)$rule['id']; ?>, <?php print (int)$rule['tree_id']; ?>, <?php print (int)$rule['tree_item_id']; ?>);
         <?php endif; ?>
@@ -621,15 +718,12 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
     <?php
 }
 
-function cereus_datasync_render_agg_rule_card(array $rule, array $trees, array $gTpls, array $aTpls, array $matchFields): void {
+function cereus_datasync_render_agg_rule_card(array $rule, array $trees, array $gTpls, array $aTpls, array $condFields, array $operators): void {
     $rid       = (int)$rule['id'];
     $pmode     = (int)($rule['placement_mode'] ?? 0);
-    $condLogic = strtoupper($rule['condition_logic'] ?? 'AND');
-    $devVis    = !empty($rule['device_match_field'])  ? '' : 'display:none;';
-    $devVis2   = !empty($rule['device_match_field2']) ? '' : 'display:none;';
-    $cond2Vis  = !empty($rule['device_match_field'])  ? '' : 'display:none;';
     $nodeVis   = ($pmode === 1) ? 'display:none;' : '';
     $siteVis   = ($pmode === 0) ? 'display:none;' : '';
+    $conds     = cereus_datasync_get_agg_conditions($rid);
 
     print '<div id="cds-agg-card-' . $rid . '">';
     html_start_box('', '100%', '', '3', 'center', '');
@@ -703,58 +797,34 @@ function cereus_datasync_render_agg_rule_card(array $rule, array $trees, array $
     }
     print '</select></div>';
 
-    // Device Filter Field (condition 1)
-    print '<div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:3px;">'
-        . __('Device Filter Field', 'cereus_datasync') . '</label>';
-    print '<select id="cds-agg-mfield-' . $rid . '" class="cds-agg-mfield ui-state-default ui-corner-all" data-id="' . $rid . '" style="width:100%;">';
-    foreach ($matchFields as $fv => $fl) {
-        print '<option value="' . html_escape($fv) . '"' . ($fv === $rule['device_match_field'] ? ' selected' : '') . '>' . html_escape($fl) . '</option>';
+    // Device match conditions — full-width sub-table with AND/OR + parenthesis grouping
+    print '<div style="grid-column:1/-1;">';
+    print '<label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px;">'
+        . __('Device Match Conditions (optional — leave empty to include every device using the template)', 'cereus_datasync') . '</label>';
+    print '<table class="cactiTable cds-aggcond-table" id="cds-aggcond-' . $rid . '" style="width:100%;border-collapse:collapse;">';
+    print '<thead><tr style="background:#f8fafc;">';
+    print '<th style="padding:5px 8px;width:70px;text-align:left;font-size:12px;">' . __('Join', 'cereus_datasync') . '</th>';
+    print '<th style="padding:5px 4px;width:44px;text-align:center;font-size:12px;" title="' . __('Opening parentheses before this condition', 'cereus_datasync') . '">(</th>';
+    print '<th style="padding:5px 8px;width:24%;text-align:left;font-size:12px;">' . __('Field', 'cereus_datasync') . '</th>';
+    print '<th style="padding:5px 8px;width:18%;text-align:left;font-size:12px;">' . __('Operator', 'cereus_datasync') . '</th>';
+    print '<th style="padding:5px 8px;text-align:left;font-size:12px;">' . __('Pattern', 'cereus_datasync') . '</th>';
+    print '<th style="padding:5px 4px;width:44px;text-align:center;font-size:12px;" title="' . __('Closing parentheses after this condition', 'cereus_datasync') . '">)</th>';
+    print '<th style="width:40px;padding:5px 8px;"></th>';
+    print '</tr></thead>';
+    print '<tbody id="cds-aggcond-tbody-' . $rid . '">';
+    if (cacti_sizeof($conds)) {
+        foreach ($conds as $cond) {
+            cereus_datasync_render_agg_condition_row($rid, $cond, $condFields, $operators);
+        }
+    } else {
+        print '<tr id="cds-aggcond-empty-' . $rid . '"><td colspan="7" style="padding:10px;color:#999;font-style:italic;font-size:12px;">'
+            . __('No conditions — the aggregate includes every device using this Graph Template.', 'cereus_datasync') . '</td></tr>';
     }
-    print '</select></div>';
-
-    // Device Filter Pattern (condition 1)
-    print '<div id="cds-agg-mpat-wrap-' . $rid . '" style="' . $devVis . '">';
-    print '<label style="font-size:11px;color:#64748b;display:block;margin-bottom:3px;">'
-        . __('Device Filter Pattern (substring)', 'cereus_datasync') . '</label>';
-    print '<input type="text" id="cds-agg-mpat-' . $rid . '" class="cds-agg-field ui-state-default ui-corner-all"'
-        . ' data-id="' . $rid . '" value="' . html_escape($rule['device_match_pattern']) . '"'
-        . ' style="width:100%;font-family:monospace;">';
+    print '</tbody></table>';
+    print '<div style="margin-top:6px;">';
+    print '<button type="button" class="ui-button cds-add-aggcond" data-id="' . $rid . '" style="font-size:12px;">+ ' . __('Add Condition', 'cereus_datasync') . '</button>';
     print '</div>';
-
-    // ── Second condition (AND/OR) — visible when first condition field is set
-    print '<div id="cds-agg-cond2-wrap-' . $rid . '" style="grid-column:1/-1;' . $cond2Vis . '">';
-
-    // AND / OR divider
-    print '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 8px;">';
-    print '<span style="flex:1;border-top:1px solid #e2e8f0;"></span>';
-    print '<select id="cds-agg-clogic-' . $rid . '" class="cds-agg-field ui-state-default ui-corner-all"'
-        . ' data-id="' . $rid . '" style="font-size:11px;font-weight:700;padding:1px 8px;">';
-    print '<option value="AND"' . ($condLogic === 'AND' ? ' selected' : '') . '>AND</option>';
-    print '<option value="OR"'  . ($condLogic === 'OR'  ? ' selected' : '') . '>OR</option>';
-    print '</select>';
-    print '<span style="flex:1;border-top:1px solid #e2e8f0;"></span>';
-    print '</div>';
-
-    // Second condition fields
-    print '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">';
-    print '<div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:3px;">'
-        . __('Second Condition Field', 'cereus_datasync') . '</label>';
-    print '<select id="cds-agg-mfield2-' . $rid . '" class="cds-agg-mfield2 ui-state-default ui-corner-all" data-id="' . $rid . '" style="width:100%;">';
-    foreach ($matchFields as $fv => $fl) {
-        print '<option value="' . html_escape($fv) . '"' . ($fv === ($rule['device_match_field2'] ?? '') ? ' selected' : '') . '>' . html_escape($fl) . '</option>';
-    }
-    print '</select></div>';
-
-    print '<div id="cds-agg-mpat2-wrap-' . $rid . '" style="' . $devVis2 . '">';
-    print '<label style="font-size:11px;color:#64748b;display:block;margin-bottom:3px;">'
-        . __('Second Condition Pattern', 'cereus_datasync') . '</label>';
-    print '<input type="text" id="cds-agg-mpat2-' . $rid . '" class="cds-agg-field ui-state-default ui-corner-all"'
-        . ' data-id="' . $rid . '" value="' . html_escape($rule['device_match_pattern2'] ?? '') . '"'
-        . ' style="width:100%;font-family:monospace;">';
-    print '</div>';
-    print '</div>'; // second condition inner grid
-
-    print '</div>'; // cond2-wrap
+    print '</div>'; // conditions block
 
     // Graph Title Filter — full width
     print '<div style="grid-column:1/-1;">';
@@ -1070,11 +1140,47 @@ function cereus_datasync_render_condition_row(int $tplId, array $cond, array $fi
     print '</tr>';
 }
 
-// Small 0-3 parenthesis-count dropdown used by the tree-rule condition editor.
+// ─── Condition row helper (aggregate rules tab) ──────────────────────────────
+
+function cereus_datasync_render_agg_condition_row(int $rid, array $cond, array $fields, array $operators): void {
+    $connector = (strtoupper($cond['connector'] ?? 'AND') === 'OR') ? 'OR' : 'AND';
+    $open      = max(0, min(5, (int)($cond['open_paren']  ?? 0)));
+    $close     = max(0, min(5, (int)($cond['close_paren'] ?? 0)));
+    print '<tr data-cid="' . (int)$cond['id'] . '" data-rid="' . $rid . '">';
+
+    print '<td style="padding:3px 4px;"><select class="cds-aggcond-conn ui-state-default ui-corner-all" style="width:100%;">';
+    foreach (['AND' => 'AND', 'OR' => 'OR'] as $cv => $cl) {
+        print '<option value="' . $cv . '"' . ($cv === $connector ? ' selected' : '') . '>' . $cl . '</option>';
+    }
+    print '</select></td>';
+
+    print '<td style="padding:3px 2px;">' . cereus_datasync_paren_select('cds-aggcond-open', $open) . '</td>';
+
+    print '<td style="padding:3px 6px;"><select class="cds-aggcond-field ui-state-default ui-corner-all" style="width:100%;">';
+    foreach ($fields as $fv => $fl) {
+        print '<option value="' . html_escape($fv) . '"' . ($fv === $cond['field'] ? ' selected' : '') . '>' . html_escape($fl) . '</option>';
+    }
+    print '</select></td>';
+
+    print '<td style="padding:3px 6px;"><select class="cds-aggcond-op ui-state-default ui-corner-all" style="width:100%;">';
+    foreach ($operators as $ov => $ol) {
+        print '<option value="' . $ov . '"' . ($ov == $cond['operator'] ? ' selected' : '') . '>' . html_escape($ol) . '</option>';
+    }
+    print '</select></td>';
+
+    print '<td style="padding:3px 6px;"><input type="text" class="cds-aggcond-pat ui-state-default ui-corner-all" value="' . html_escape($cond['pattern']) . '" style="width:100%;font-family:monospace;"></td>';
+    print '<td style="padding:3px 2px;">' . cereus_datasync_paren_select('cds-aggcond-close', $close) . '</td>';
+    print '<td style="padding:3px 6px;text-align:center;"><button type="button" class="ui-button cds-del-aggcond" data-cid="' . (int)$cond['id'] . '" data-rid="' . $rid . '" style="min-width:0;padding:2px 6px;">&#128465;</button></td>';
+    print '</tr>';
+}
+
+// Small 0-3 parenthesis-count dropdown used by the tree-rule and aggregate-rule condition
+// editors. The glyph is chosen by whether the class names an opening or closing count.
 function cereus_datasync_paren_select(string $class, int $value): string {
+    $glyph = (strpos($class, 'open') !== false) ? '(' : ')';
     $html = '<select class="' . $class . ' ui-state-default ui-corner-all" style="width:100%;text-align:center;">';
     for ($i = 0; $i <= 3; $i++) {
-        $label = $i === 0 ? '–' : str_repeat($class === 'cds-cond-open' ? '(' : ')', $i);
+        $label = $i === 0 ? '–' : str_repeat($glyph, $i);
         $html .= '<option value="' . $i . '"' . ($i === $value ? ' selected' : '') . '>' . $label . '</option>';
     }
     return $html . '</select>';

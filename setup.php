@@ -47,7 +47,57 @@ function plugin_cereus_datasync_upgrade() {
     api_plugin_register_hook('cereus_datasync', 'device_remove',        'cereus_datasync_device_remove',        'lib/device_delete_cleanup.php', true);
     api_plugin_register_hook('cereus_datasync', 'device_action_bottom', 'cereus_datasync_device_action_bottom', 'lib/device_delete_cleanup.php', true);
 
+    cereus_datasync_backfill_title_caches();
+
     return true;
+}
+
+/**
+ * One-off backfill for the stale graph title caches left by releases before 1.5.1.
+ *
+ * Cacti stores the substituted graph title in graph_templates_graph.title_cache and
+ * the data source name in data_template_data.name_cache. Only api_device_save()
+ * refreshes them, and the sync wrote host.description directly — so every device the
+ * sync tagged for deletion or renamed kept its old title on all of its graphs. The
+ * sync now refreshes them inline; this catches up the devices that already drifted.
+ *
+ * Selection is by evidence rather than by tag: any device whose graph title is built
+ * from |host_description| but whose cached title no longer contains the device's
+ * current description. That covers tagged and renamed devices alike, and skips
+ * installs with nothing to fix. LOCATE() is used instead of LIKE so that a
+ * description containing % or _ is matched literally.
+ */
+function cereus_datasync_backfill_title_caches() {
+    global $config;
+
+    if (read_config_option('cereus_datasync_title_cache_backfill') == 1) {
+        return;
+    }
+
+    if (!function_exists('update_graph_title_cache_from_host')) {
+        require_once $config['base_path'] . '/lib/variables.php';
+    }
+
+    $hosts = db_fetch_assoc("SELECT DISTINCT gl.host_id
+        FROM graph_local AS gl
+        INNER JOIN graph_templates_graph AS gtg
+        ON gtg.local_graph_id = gl.id
+        INNER JOIN host AS h
+        ON h.id = gl.host_id
+        WHERE gl.host_id > 0
+        AND gtg.title LIKE '%|host_description|%'
+        AND h.description != ''
+        AND LOCATE(h.description, gtg.title_cache) = 0");
+
+    foreach ($hosts as $host) {
+        update_data_source_title_cache_from_host((int)$host['host_id']);
+        update_graph_title_cache_from_host((int)$host['host_id']);
+    }
+
+    set_config_option('cereus_datasync_title_cache_backfill', 1);
+
+    cacti_log('cereus_datasync: refreshed stale graph title caches for ' . cacti_sizeof($hosts) . ' device(s)',
+        false, 'CEREUS_DATASYNC');
 }
 
 // ─── Page head hook ──────────────────────────────────────────────────────────

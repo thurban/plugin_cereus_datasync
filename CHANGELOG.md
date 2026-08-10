@@ -5,6 +5,31 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-08-10
+
+### Fixed
+- **Graphs kept their old title after the device was tagged for deletion.** A
+  device removed from the source inventory was correctly tagged on
+  `host.description`, but its graphs continued to show the untagged name, so the
+  graphs could not be found by searching for the deletion tag. Cacti substitutes
+  `|host_description|` once and stores the result in
+  `graph_templates_graph.title_cache` (and the data source name in
+  `data_template_data.name_cache`); nothing recomputes those columns when the
+  description changes except `api_device_save()`, which the sync calls only when
+  adding a device. Both caches are now refreshed whenever the sync tags a device
+  for deletion or updates its description or location — the same drift affected
+  devices renamed or moved in the source inventory, which kept their old graph
+  titles indefinitely.
+- One-off backfill on upgrade refreshes the graph and data source title caches of
+  every device that already drifted, so previously tagged or renamed devices
+  catch up without waiting for their next change. Devices are selected by
+  evidence (cached title no longer contains the device's current description),
+  not by tag, and the backfill runs once.
+
+  Note: `update_graph_title_cache()` declines to overwrite a non-empty cache when
+  the substituted title still contains an unresolved `|host_` or `|query_`
+  variable, so a graph whose data query index has disappeared stays stale.
+
 ## [1.5.0] - 2026-08-10
 
 ### Added

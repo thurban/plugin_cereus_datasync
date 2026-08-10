@@ -166,6 +166,9 @@ class CereusDatasyncEngine {
                 } else {
                     $ok = $devMgr->markAsDeleted($device['id'], 'Not found in Excel import ' . date('Y-m-d'));
                     if ($ok) {
+                        // The tag went onto host.description directly, so every graph
+                        // still carries its pre-tag cached title until this runs.
+                        $this->refreshTitleCaches((int)$device['id']);
                         $this->stats['marked_deleted']++;
                         $this->logDetail('marked_deleted', $device['description'], $device['hostname'], (int)$device['id'], '');
                     } else {
@@ -262,6 +265,9 @@ class CereusDatasyncEngine {
                     $ok = $ok && $devMgr->updateLocationAndSite((int)$upd['cactiDev']['id'], $upd['exLocation'], $upd['exSiteId'], $upd['exDev']['hostname']);
                 }
                 if ($ok) {
+                    // Graph titles embed |host_description| and |host_location|, both
+                    // of which this branch may just have changed underneath them.
+                    $this->refreshTitleCaches((int)$upd['cactiDev']['id']);
                     $this->stats['updated']++;
                     $this->logDetail('updated', $upd['exDev']['hostname'], $upd['exDev']['ip'], (int)$upd['cactiDev']['id'], '');
                 } else {
@@ -1311,6 +1317,34 @@ class CereusDatasyncEngine {
         );
 
         return (int)db_fetch_insert_id();
+    }
+
+    /**
+     * Refresh the cached graph and data-source titles for one device.
+     *
+     * Cacti substitutes |host_description| / |host_location| once and stores the
+     * result in graph_templates_graph.title_cache and data_template_data.name_cache.
+     * Nothing recomputes those columns when host.description changes — there is no
+     * database trigger, and the only refresh path in core is api_device_save()
+     * (lib/api_device.php), which this sync calls exclusively when adding a device.
+     * So a device that is tagged for deletion or renamed in the source inventory
+     * keeps its old title on every graph until this runs.
+     *
+     * Note that update_graph_title_cache() declines to overwrite a non-empty cache
+     * when the substituted title still contains an unresolved |host_ or |query_
+     * variable, so a graph whose data query index has disappeared stays stale.
+     */
+    private function refreshTitleCaches(int $deviceId): void {
+        global $config;
+
+        if (!$deviceId || $this->dryRun) return;
+
+        if (!function_exists('update_graph_title_cache_from_host')) {
+            require_once $config['base_path'] . '/lib/variables.php';
+        }
+
+        update_data_source_title_cache_from_host($deviceId);
+        update_graph_title_cache_from_host($deviceId);
     }
 
     // ─── Tree rule application ───────────────────────────────────────────────

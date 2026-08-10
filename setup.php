@@ -6,6 +6,8 @@ function plugin_cereus_datasync_install() {
     api_plugin_register_hook('cereus_datasync', 'draw_navigation_text', 'cereus_datasync_draw_navigation', 'includes/arrays.php');
     api_plugin_register_hook('cereus_datasync', 'page_head',            'cereus_datasync_page_head',       'setup.php');
     api_plugin_register_hook('cereus_datasync', 'poller_bottom',        'cereus_datasync_poller_bottom',   'setup.php');
+    api_plugin_register_hook('cereus_datasync', 'device_remove',        'cereus_datasync_device_remove',        'lib/device_delete_cleanup.php');
+    api_plugin_register_hook('cereus_datasync', 'device_action_bottom', 'cereus_datasync_device_action_bottom', 'lib/device_delete_cleanup.php');
 
     api_plugin_register_realm('cereus_datasync',
         'cereus_datasync.php,cereus_datasync_edit.php,cereus_datasync_rules.php,cereus_datasync_agrules.php,cereus_datasync_log.php,cereus_datasync_ajax.php,cereus_datasync_sample.php',
@@ -40,6 +42,11 @@ function plugin_cereus_datasync_check_config() {
 
 function plugin_cereus_datasync_upgrade() {
     cereus_datasync_setup_tables();
+
+    // Register hooks added after the initial install (idempotent).
+    api_plugin_register_hook('cereus_datasync', 'device_remove',        'cereus_datasync_device_remove',        'lib/device_delete_cleanup.php', true);
+    api_plugin_register_hook('cereus_datasync', 'device_action_bottom', 'cereus_datasync_device_action_bottom', 'lib/device_delete_cleanup.php', true);
+
     return true;
 }
 
@@ -48,8 +55,19 @@ function plugin_cereus_datasync_upgrade() {
 function cereus_datasync_page_head() {
     global $config;
     $base = $config['url_path'] . 'plugins/cereus_datasync/';
-    print '<link rel="stylesheet" type="text/css" href="' . $base . 'css/cereus_datasync.css">' . PHP_EOL;
-    print '<script src="' . $base . 'js/cereus_datasync.js"></script>' . PHP_EOL;
+
+    // Cache-bust CSS/JS with the plugin version so browsers reload them after an
+    // upgrade instead of serving a stale copy.
+    $info = parse_ini_file($config['base_path'] . '/plugins/cereus_datasync/INFO', true);
+    $ver  = isset($info['info']['version']) ? $info['info']['version'] : '0';
+
+    print '<link rel="stylesheet" type="text/css" href="' . $base . 'css/cereus_datasync.css?v=' . urlencode($ver) . '">' . PHP_EOL;
+    print '<script src="' . $base . 'js/cereus_datasync.js?v=' . urlencode($ver) . '"></script>' . PHP_EOL;
+
+    // Signal to the frontend whether the device-delete empty-container cleanup
+    // option should be offered (Professional tier and up).
+    require_once $config['base_path'] . '/plugins/cereus_datasync/lib/license_check.php';
+    print '<script>window.cereusDatasyncDeleteCleanup = ' . (cereus_datasync_license_ok() ? 'true' : 'false') . ';</script>' . PHP_EOL;
 }
 
 // ─── Poller hook ─────────────────────────────────────────────────────────────
@@ -138,6 +156,8 @@ function cereus_datasync_setup_tables() {
         default_poller_id          INT UNSIGNED     NOT NULL DEFAULT 1,
         deletion_tag               VARCHAR(64)      NOT NULL DEFAULT '[TO BE DELETED]',
         deletion_skip_localhost    TINYINT(1)       NOT NULL DEFAULT 1,
+        mark_empty_sites           TINYINT(1)       NOT NULL DEFAULT 1,
+        mark_empty_tree_items      TINYINT(1)       NOT NULL DEFAULT 1,
         auto_graph_rules           TINYINT(1)       NOT NULL DEFAULT 0,
         auto_create_graphs         TINYINT(1)       NOT NULL DEFAULT 0,
         graph_query_type_id        INT UNSIGNED     NOT NULL DEFAULT 0,
@@ -181,6 +201,7 @@ function cereus_datasync_setup_tables() {
         tree_id      INT UNSIGNED NOT NULL DEFAULT 0,
         leaf_type    TINYINT UNSIGNED NOT NULL DEFAULT 2,
         host_grouping TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        branch_path  VARCHAR(255) NOT NULL DEFAULT '{region}/{country}/{site}' COLLATE utf8mb4_unicode_ci,
         PRIMARY KEY (id),
         INDEX idx_profile_order (profile_id, rule_order)
     ) $charset");
@@ -218,6 +239,10 @@ function cereus_datasync_setup_tables() {
         tree_placed         INT UNSIGNED NOT NULL DEFAULT 0,
         graphs_found        INT UNSIGNED NOT NULL DEFAULT 0,
         graphs_created      INT UNSIGNED NOT NULL DEFAULT 0,
+        empty_sites_marked  INT UNSIGNED NOT NULL DEFAULT 0,
+        empty_trees_marked  INT UNSIGNED NOT NULL DEFAULT 0,
+        sites_unmarked      INT UNSIGNED NOT NULL DEFAULT 0,
+        trees_unmarked      INT UNSIGNED NOT NULL DEFAULT 0,
         error_message  TEXT,
         PRIMARY KEY (id),
         INDEX idx_profile (profile_id),
@@ -280,6 +305,16 @@ function cereus_datasync_setup_tables() {
         // Preserve existing behaviour: prior rows used operation 2=OR, anything else=AND.
         db_execute("UPDATE plugin_cds_rule_conditions SET connector = 'OR'  WHERE operation = 2");
         db_execute("UPDATE plugin_cds_rule_conditions SET connector = 'AND' WHERE operation <> 2");
+    }
+
+    // Migration: tree-rule templates — operator-defined branch path. The generated
+    // branch was fixed at Region/Country/Site; branch_path lets each template pick
+    // its own levels (or a literal collector branch). The default reproduces the
+    // former hierarchy so existing templates keep their rules and their names.
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_tree_rules LIKE 'branch_path'"))) {
+        db_execute("ALTER TABLE plugin_cds_tree_rules
+            ADD COLUMN branch_path VARCHAR(255) NOT NULL DEFAULT '{region}/{country}/{site}'
+            COLLATE utf8mb4_unicode_ci AFTER host_grouping");
     }
 
     // Migration: add graph_title_pattern to aggregate rules table
@@ -379,5 +414,26 @@ function cereus_datasync_setup_tables() {
         db_execute("ALTER TABLE plugin_cds_profiles
             ADD COLUMN auto_create_graphs  TINYINT(1)   NOT NULL DEFAULT 0 AFTER auto_graph_rules,
             ADD COLUMN graph_query_type_id INT UNSIGNED NOT NULL DEFAULT 0 AFTER auto_create_graphs");
+    }
+
+    // Migration: add empty-container marking toggles to existing installs
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_profiles LIKE 'mark_empty_sites'"))) {
+        db_execute("ALTER TABLE plugin_cds_profiles
+            ADD COLUMN mark_empty_sites      TINYINT(1) NOT NULL DEFAULT 1 AFTER deletion_skip_localhost,
+            ADD COLUMN mark_empty_tree_items TINYINT(1) NOT NULL DEFAULT 1 AFTER mark_empty_sites");
+    }
+
+    // Migration: add empty-container run counters to existing installs
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_runs LIKE 'empty_sites_marked'"))) {
+        db_execute("ALTER TABLE plugin_cds_runs
+            ADD COLUMN empty_sites_marked INT UNSIGNED NOT NULL DEFAULT 0 AFTER graphs_created,
+            ADD COLUMN empty_trees_marked INT UNSIGNED NOT NULL DEFAULT 0 AFTER empty_sites_marked");
+    }
+
+    // Migration: add tag-reconciliation (un-mark) run counters to existing installs
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_runs LIKE 'sites_unmarked'"))) {
+        db_execute("ALTER TABLE plugin_cds_runs
+            ADD COLUMN sites_unmarked INT UNSIGNED NOT NULL DEFAULT 0 AFTER empty_trees_marked,
+            ADD COLUMN trees_unmarked INT UNSIGNED NOT NULL DEFAULT 0 AFTER sites_unmarked");
     }
 }

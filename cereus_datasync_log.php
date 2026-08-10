@@ -173,6 +173,10 @@ function cereus_datasync_log_detail(int $runId): void {
         ['skipped',        $run['skipped'],                      'Skipped',     '#64748b', '#f8fafc'],
         ['failed',         $run['failed'],                       'Failed',      '#dc2626', '#fef2f2'],
         ['load_skip',      $run['excel_skipped_load'] ?? 0,      'Dropped',     '#f97316', '#fff7ed'],
+        ['empty_site',     $run['empty_sites_marked'] ?? 0,      'Empty Sites',    '#b45309', '#fffbeb'],
+        ['empty_tree',     $run['empty_trees_marked'] ?? 0,      'Empty Branches', '#7c3aed', '#f5f3ff'],
+        ['site_unmarked',  $run['sites_unmarked'] ?? 0,          'Sites Revived',    '#0d9488', '#f0fdfa'],
+        ['tree_unmarked',  $run['trees_unmarked'] ?? 0,          'Branches Revived', '#0d9488', '#f0fdfa'],
     ];
     $graphCards = [
         ['graph_created',  $run['graphs_created'] ?? 0, 'Graphs Created', '#0891b2', '#ecfeff'],
@@ -322,6 +326,15 @@ function cereus_datasync_log_detail(int $runId): void {
         'graph_created'      => '#0891b2',
         'auto_rule'          => '#7c3aed',
         'tree_placed'        => '#7c3aed',
+        'tree_moved'         => '#9333ea',
+        'empty_site'         => '#b45309',
+        'empty_site_dry'     => '#b4530980',
+        'empty_tree'         => '#7c3aed',
+        'empty_tree_dry'     => '#7c3aed80',
+        'site_unmarked'      => '#0d9488',
+        'site_unmarked_dry'  => '#0d948880',
+        'tree_unmarked'      => '#0d9488',
+        'tree_unmarked_dry'  => '#0d948880',
     ];
 
     $header = [

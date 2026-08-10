@@ -107,6 +107,9 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
         . '&bull; <code>{site}</code> — Site name from Excel (truncated to 40 chars to match <strong>h.location</strong>).<br>'
         . '&bull; <code>{region}</code> — Region from Excel.<br>'
         . '&bull; <code>{country}</code> — Country from Excel.<br><br>'
+        . '<strong>Branch path:</strong> the tree branch the generated rule points at, written as <code>/</code>-separated levels. Each level is either literal text or a placeholder, so you choose the depth yourself — '
+        . '<code>{region}/{country}/{site}</code>, <code>{region}/{country}</code>, <code>{site}</code>, or a fixed collector branch such as <code>Internet</code> or <code>Internet/{region}</code>. '
+        . 'A level whose placeholder is empty for a device is skipped, and locations that land on the same branch with the same conditions share one rule instead of generating duplicates.<br><br>'
         . '<strong>Grouping:</strong> each condition joins to the previous one with <strong>AND</strong> or <strong>OR</strong>, and the <strong>(</strong> / <strong>)</strong> columns add parentheses so you can build grouped logic — e.g. '
         . '<code>h.site_id&nbsp;equals&nbsp;{site_id} AND ( h.location&nbsp;begins&nbsp;Stuttgart OR h.location&nbsp;begins&nbsp;München OR h.location&nbsp;begins&nbsp;Lübeck )</code>. '
         . 'Balance every <strong>(</strong> with a matching <strong>)</strong>.',
@@ -145,6 +148,11 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
             print '</select>';
             print '<label style="font-size:12px;"><input type="checkbox" class="cds-tpl-enabled" data-id="' . $tplId . '"' . ($tpl['enabled'] === 'on' ? ' checked' : '') . '> ' . __('Enabled', 'cereus_datasync') . '</label>';
             print '<button type="button" class="ui-button cds-tpl-del" data-id="' . $tplId . '" style="margin-left:auto;min-width:0;padding:2px 10px;color:#dc2626;border-color:#fca5a5;">&#128465; Delete</button>';
+            print '</div>';
+            print '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">';
+            print '<span style="font-size:12px;color:#475569;white-space:nowrap;">' . __('Branch path', 'cereus_datasync') . '</span>';
+            print '<input type="text" class="cds-tpl-path ui-state-default ui-corner-all" data-id="' . $tplId . '" value="' . html_escape($tpl['branch_path']) . '" placeholder="{region}/{country}/{site}" style="flex:1;font-family:monospace;">';
+            print '<span style="font-size:11px;color:#64748b;white-space:nowrap;">' . __('literal text and %s allowed', '<code>{region} {country} {site}</code>', 'cereus_datasync') . '</span>';
             print '</div>';
             print '</td></tr>';
 
@@ -266,7 +274,7 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
     }
 
     $(function() {
-        $(document).on('blur change', '.cds-tpl-name, .cds-tpl-tree, .cds-tpl-leaf, .cds-tpl-grp, .cds-tpl-enabled', function() {
+        $(document).on('blur change', '.cds-tpl-name, .cds-tpl-tree, .cds-tpl-leaf, .cds-tpl-grp, .cds-tpl-path, .cds-tpl-enabled', function() {
             saveTpl($(this).data('id'));
         });
 
@@ -280,6 +288,7 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
                 tree_id:       $('.cds-tpl-tree[data-id="' + tid + '"]').val(),
                 leaf_type:     $('.cds-tpl-leaf[data-id="' + tid + '"]').val(),
                 host_grouping: $('.cds-tpl-grp[data-id="' + tid + '"]').val(),
+                branch_path:   $('.cds-tpl-path[data-id="' + tid + '"]').val(),
                 enabled:       $('.cds-tpl-enabled[data-id="' + tid + '"]').is(':checked') ? 'on' : '',
                 __csrf_magic:  csrfMagicToken
             }, function() { cdsShowSaved(); }, 'json');

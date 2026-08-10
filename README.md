@@ -10,14 +10,31 @@ A commercial [Cereus](https://urban-software.de) plugin for
 
 - **Inventory sync** — import devices from an Excel/CSV inventory file, mapping
   columns to Cacti device fields, with add/update/delete reconciliation and a
-  configurable deletion tag.
+  configurable deletion tag. Description/location/site changes are recorded as
+  timestamped entries in each device's Notes field.
+- **Empty container cleanup** — after devices are tagged for deletion, any site
+  with no live devices (including sites with no hosts at all) and any tree branch
+  left with no live devices are automatically flagged with the deletion tag so
+  they are easy to find and remove manually (toggleable per profile). Because
+  deletion is manual, a later sync that adds devices to a still-existing flagged
+  container reuses it and automatically removes the tag again.
+- **Delete empty containers on device deletion** — Cacti's own Console →
+  Devices delete-confirmation screen gains an opt-in checkbox to also remove any
+  Site or tree branch that the deleted device(s) leave empty. Empty parent
+  headers are pruned upward in a single pass; containers still holding another
+  live device are never touched. Delivered via Cacti's hook API — no core files
+  are modified.
 - **Profiles** — multiple named sync profiles, each with its own file source,
   column map, SNMP defaults, and schedule (manual, every poller, hourly, daily,
   weekly).
 - **Tree placement rules** — template-driven Cacti automation rules that place
   matching devices/graphs into the tree per unique location. Conditions support
   full boolean grouping (**AND**/**OR** connectors with parentheses) and
-  location placeholders (`{site_id}`, `{site}`, `{region}`, `{country}`).
+  location placeholders (`{site_id}`, `{site}`, `{region}`, `{country}`). Each
+  template defines its own **branch path**, so you choose the hierarchy the rule
+  builds — `{region}/{country}/{site}`, `{region}/{country}`, `{site}`, or a
+  fixed collector branch such as `Internet/{region}` that gathers matching
+  graphs from every site into one place.
 - **Aggregate graph rules** — build/rebuild aggregate graphs from all member
   graphs matching a graph template, an unbounded list of device match
   conditions (**AND**/**OR** connectors with parenthesis grouping), and an

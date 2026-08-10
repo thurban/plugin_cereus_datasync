@@ -18,6 +18,8 @@ class CereusDatasyncEngine {
         'marked_deleted'     => 0, 'skipped'             => 0,
         'failed'             => 0, 'tree_placed'         => 0,
         'graphs_found'       => 0, 'graphs_created'      => 0,
+        'empty_sites_marked' => 0, 'empty_trees_marked'  => 0,
+        'sites_unmarked'     => 0, 'trees_unmarked'      => 0,
         'checking'           => 0, // devices pending SNMP interface name check
     ];
 
@@ -268,6 +270,11 @@ class CereusDatasyncEngine {
                 }
                 $this->flushStats(); // persist before risky graph creation
 
+                // Office moved (or a name change affecting tree rules) — re-place
+                // the device in the tree so its branch follows the new location,
+                // and remove the now-stale placement under the old branch.
+                $this->stats['tree_placed'] += $this->reconcileTreePlacement((int)$upd['cactiDev']['id'], $upd['exDev']);
+
                 // Recheck WAN graphs for updated devices (only if no graphs exist yet)
                 $this->maybeCreateWanGraphs((int)$upd['cactiDev']['id'], $upd['exDev']);
             }
@@ -327,6 +334,12 @@ class CereusDatasyncEngine {
                 $this->applyAggregateRules();
                 $this->applyOidGraphRules();
             }
+
+            // ── Flag containers left empty by this sync ────────────────────────
+            // Runs last, after every add/update/delete and graph/tree placement,
+            // so the tree and site membership reflect the final post-sync state.
+            $this->markEmptyContainers();
+            $this->flushStats();
 
             $this->finishRun('completed');
 
@@ -1036,8 +1049,16 @@ class CereusDatasyncEngine {
             }
         }
 
-        // Collect unique locations from the full Excel device set
-        $seen = [];
+        // Collect unique locations from the full Excel device set.
+        //
+        // $materialised and $usedNames live for the whole pass, not per location: a
+        // branch path that drops the site level (or is entirely literal) collapses
+        // many locations onto one branch, and without them the same rule would be
+        // rebuilt — and its conditions overwritten — once per location.
+        $seen         = [];
+        $materialised = [];
+        $usedNames    = [];
+
         foreach ($excelDevices as $device) {
             $parts = array_values(array_filter([
                 trim($device['region']  ?? ''),
@@ -1052,12 +1073,36 @@ class CereusDatasyncEngine {
             foreach ($templates as $tpl) {
                 $tplConds = $conditions[(int)$tpl['id']] ?? [];
                 if (empty($tplConds)) continue;
-                $this->applyRuleTemplate($tpl, $tplConds, $parts, $device);
+                $this->applyRuleTemplate($tpl, $tplConds, $device, $materialised, $usedNames);
             }
         }
     }
 
-    private function applyRuleTemplate(array $tpl, array $conditions, array $locationParts, array $device): void {
+    /**
+     * Expand a template's branch_path into the ordered list of tree header titles.
+     * Segments split on "/", each one either literal text or built from the
+     * {region} {country} {site} placeholders. A segment that resolves to nothing is
+     * dropped, so "{region}/{country}/{site}" still degrades cleanly for a device
+     * with no country. An empty path falls back to the full location hierarchy,
+     * which is what every template did before the path became configurable.
+     */
+    private function resolveBranchPath(string $path, array $subs): array {
+        $path = trim($path);
+        if ($path === '') {
+            $path = '{region}/{country}/{site}';
+        }
+
+        $titles = [];
+        foreach (explode('/', $path) as $segment) {
+            $title = trim(str_replace(array_keys($subs), array_values($subs), trim($segment)));
+            if ($title === '') continue;
+            $titles[] = substr($title, 0, 255);
+        }
+
+        return $titles;
+    }
+
+    private function applyRuleTemplate(array $tpl, array $conditions, array $device, array &$materialised, array &$usedNames): void {
         $treeId = (int)$tpl['tree_id'];
         if (!$treeId) return;
 
@@ -1082,9 +1127,47 @@ class CereusDatasyncEngine {
             '{site_id}'  => (string)$resolvedSiteId,
         ];
 
+        // Which branch does this template want for this location? Branch titles use
+        // the untruncated values — the 40-char clamp above exists only to match the
+        // truncated h.location column, and applying it here would rename the branches
+        // of any site with a long name.
+        $branchParts = $this->resolveBranchPath((string)($tpl['branch_path'] ?? ''), [
+            '{site}'     => trim($device['site']    ?? ''),
+            '{region}'   => trim($device['region']  ?? ''),
+            '{country}'  => trim($device['country'] ?? ''),
+            '{location}' => trim($device['site']    ?? ''),
+        ]);
+        if (empty($branchParts)) {
+            $this->logDetail('auto_rule', '', '', null,
+                'Skipped "' . $tpl['name'] . '" — branch path "' . trim((string)($tpl['branch_path'] ?? ''))
+                . '" resolved to nothing for location ' . ($locationKey !== '' ? $locationKey : '(none)'));
+            return;
+        }
+
+        // Resolve the conditions up front: together with the branch they decide the
+        // rule's identity, so two locations landing on the same branch with the same
+        // conditions produce one rule rather than two that overwrite each other.
+        $resolvedConds = [];
+        foreach ($conditions as $cond) {
+            $resolvedConds[] = [
+                'connector'   => (strtoupper($cond['connector'] ?? 'AND') === 'OR') ? 'OR' : 'AND',
+                'open_paren'  => max(0, (int)($cond['open_paren']  ?? 0)),
+                'close_paren' => max(0, (int)($cond['close_paren'] ?? 0)),
+                'field'       => $cond['field'],
+                'operator'    => (int)$cond['operator'],
+                'pattern'     => str_replace(array_keys($subs), array_values($subs), $cond['pattern']),
+            ];
+        }
+
+        $branchKey = implode(' / ', $branchParts);
+        $signature = md5($treeId . '|' . $branchKey . '|' . json_encode($resolvedConds));
+        $dedupKey  = (int)$tpl['id'] . '|' . $signature;
+        if (isset($materialised[$dedupKey])) return;
+        $materialised[$dedupKey] = true;
+
         // Find or create the branch path in the target tree
         $leafItemId = 0;
-        foreach ($locationParts as $title) {
+        foreach ($branchParts as $title) {
             $leafItemId = $this->findOrCreateBranch($treeId, $leafItemId, $title);
             if (!$leafItemId) return;
         }
@@ -1092,10 +1175,22 @@ class CereusDatasyncEngine {
         $leafType    = (int)$tpl['leaf_type'] ?: 2;
         $hostGrouping = (int)$tpl['host_grouping'] ?: 1;
 
+        // Name the rule after the branch it fills. A template on the default path
+        // reproduces the pre-1.5.0 name exactly, so an upgraded profile reuses its
+        // existing rules instead of orphaning them.
+        $ruleName = substr('Auto[' . $tpl['name'] . ']: ' . $branchKey, 0, 255);
+
+        // Same branch, different conditions — a literal path combined with a
+        // location-specific condition such as {site_id}. Both rules are wanted, so
+        // disambiguate rather than let the second overwrite the first.
+        if (isset($usedNames[$ruleName]) && $usedNames[$ruleName] !== $signature) {
+            $ruleName = substr($ruleName . ' #' . $locationKey, 0, 255);
+        }
+        $usedNames[$ruleName] = $signature;
+
         // Reuse the rule if it already exists (dedup by generated name), otherwise create it.
         // Reuse lets edited conditions — including newly added OR/parenthesis grouping — take
         // effect on the next sync instead of being permanently frozen at first creation.
-        $ruleName = 'Auto[' . $tpl['name'] . ']: ' . implode(' / ', $locationParts);
         $ruleId   = (int)db_fetch_cell_prepared(
             'SELECT id FROM automation_tree_rules WHERE name = ?',
             [$ruleName]
@@ -1131,12 +1226,11 @@ class CereusDatasyncEngine {
         // grouping "A AND ( B OR C OR D )" is reproduced faithfully.
         $seq   = 1;
         $first = true;
-        foreach ($conditions as $cond) {
-            $pattern = str_replace(array_keys($subs), array_values($subs), $cond['pattern']);
-            $open    = max(0, (int)($cond['open_paren']  ?? 0));
-            $close   = max(0, (int)($cond['close_paren'] ?? 0));
-            $connOp  = (strtoupper($cond['connector'] ?? 'AND') === 'OR')
-                       ? AUTOMATION_OPER_OR : AUTOMATION_OPER_AND;
+        foreach ($resolvedConds as $cond) {
+            $pattern = $cond['pattern'];
+            $open    = $cond['open_paren'];
+            $close   = $cond['close_paren'];
+            $connOp  = ($cond['connector'] === 'OR') ? AUTOMATION_OPER_OR : AUTOMATION_OPER_AND;
 
             $insertItem = function(int $operation, string $field, int $operator, string $patt) use (&$seq, $ruleId) {
                 db_execute_prepared(
@@ -1190,6 +1284,21 @@ class CereusDatasyncEngine {
         );
 
         if ($id) return $id;
+
+        // Reuse a previously flagged-empty branch (deletion tag prefixed onto the
+        // title) rather than creating a duplicate; the reconciliation pass removes
+        // the tag once the branch holds live devices again.
+        $tag = trim((string)($this->profile['deletion_tag'] ?? ''));
+        if ($tag !== '') {
+            $taggedTitle = substr($tag . ' ' . $title, 0, 255);
+            $id = (int)db_fetch_cell_prepared(
+                'SELECT id FROM graph_tree_items
+                 WHERE graph_tree_id = ? AND parent = ? AND title = ?
+                   AND local_graph_id = 0 AND host_id = 0',
+                [$treeId, $parentId, $taggedTitle]
+            );
+            if ($id) return $id;
+        }
 
         // Direct insert — avoids form_input_validate side-effects in CLI/poller context
         db_execute_prepared(
@@ -1252,6 +1361,54 @@ class CereusDatasyncEngine {
         return $placed;
     }
 
+    /**
+     * Re-place an existing device in the tree after its location (or a name field
+     * used by a tree rule) changed. Removes the device from any of this profile's
+     * managed rule-parents that no longer match, then adds it under every rule
+     * that matches now. Only touches parents referenced by this profile's own tree
+     * rules — manual placements elsewhere are left alone. Returns items added.
+     */
+    private function reconcileTreePlacement(int $deviceId, array $device): int {
+        global $config;
+
+        if (empty($this->treeRules)) return 0;
+
+        if (!function_exists('api_tree_item_save')) {
+            require_once $config['base_path'] . '/lib/api_tree.php';
+        }
+
+        // Parents a currently-matching rule wants the device to stay under.
+        $keepParents = [];
+        foreach ($this->treeRules as $rule) {
+            $treeId = (int)$rule['tree_id'];
+            if (!$treeId) continue;
+            if ($this->matchTreeRule($rule, $device)) {
+                $keepParents[$treeId . ':' . (int)$rule['tree_item_id']] = true;
+            }
+        }
+
+        // Remove the device from managed parents it should no longer be under.
+        foreach ($this->treeRules as $rule) {
+            $treeId     = (int)$rule['tree_id'];
+            $parentItem = (int)$rule['tree_item_id'];
+            if (!$treeId) continue;
+            if (isset($keepParents[$treeId . ':' . $parentItem])) continue;
+
+            $existing = api_tree_host_exists($treeId, $parentItem, $deviceId);
+            if ($existing) {
+                db_execute_prepared(
+                    'DELETE FROM graph_tree_items WHERE id = ? AND host_id = ?',
+                    [(int)$existing, $deviceId]
+                );
+                $this->logDetail('tree_moved', $device['hostname'], $device['ip'] ?? '', $deviceId,
+                    "removed stale placement tree_id=$treeId parent=$parentItem");
+            }
+        }
+
+        // Add placements under every rule that matches now (idempotent).
+        return $this->applyTreeRules($deviceId, $device);
+    }
+
     private function matchTreeRule(array $rule, array $device): bool {
         switch ($rule['match_field']) {
             case 'description':  $haystack = $device['hostname'];          break;
@@ -1275,6 +1432,349 @@ class CereusDatasyncEngine {
             case 'regex':        return (bool)@preg_match($pattern, $haystack);
             default:             return false;
         }
+    }
+
+    // ─── Empty-container marking ────────────────────────────────────────────────
+    //
+    // When devices leave the inventory they are tagged for deletion (description
+    // prefixed with the profile's deletion_tag) but remain in Cacti until an
+    // operator removes them. Once tagged, the sites and tree branches that held
+    // them are effectively empty. These methods flag those containers with the
+    // same tag so the operator can find and clean them up in the same pass.
+
+    /**
+     * Reconcile the deletion tag on sites and tree branches against their current
+     * contents after this sync: flag containers left with no live devices, and
+     * strip the tag from any previously-flagged container that is populated again
+     * (deletion is manual, so a flagged container can still exist and be reused).
+     * Marking/un-marking is non-destructive — it only edits the site/branch name
+     * (and the site note). Honours dry-run: counts, no writes.
+     */
+    private function markEmptyContainers(): void {
+        $markSites = !isset($this->profile['mark_empty_sites'])      || (int)$this->profile['mark_empty_sites'];
+        $markTrees = !isset($this->profile['mark_empty_tree_items']) || (int)$this->profile['mark_empty_tree_items'];
+        if (!$markSites && !$markTrees) {
+            return;
+        }
+
+        $tag = trim((string)($this->profile['deletion_tag'] ?? '')) ?: '[TO BE DELETED]';
+
+        if ($markSites) {
+            $this->unmarkNonEmptySites($tag);
+            $this->markEmptySites($tag);
+        }
+        if ($markTrees) {
+            // Per-tree pass handles both marking and un-marking in one traversal.
+            $this->markEmptyTreeItems($tag);
+        }
+    }
+
+    /**
+     * Remove the deletion tag from any site that was flagged empty but now holds
+     * at least one live (untagged) device again.
+     */
+    private function unmarkNonEmptySites(string $tag): void {
+        $like = '%' . $this->likeEscape($tag) . '%';
+
+        $sites = db_fetch_assoc_prepared(
+            "SELECT s.id, s.name, s.notes
+             FROM sites AS s
+             WHERE s.name LIKE ?
+               AND EXISTS (SELECT 1 FROM host h WHERE h.site_id = s.id AND h.description NOT LIKE ?)",
+            [$like, $like]
+        );
+
+        if (!cacti_sizeof($sites)) {
+            return;
+        }
+
+        foreach ($sites as $site) {
+            $cleanName = $this->stripTag((string)$site['name'], $tag);
+            if ($cleanName === (string)$site['name']) {
+                continue; // tag not a name prefix — leave it alone
+            }
+
+            $this->stats['sites_unmarked']++;
+
+            if ($this->dryRun) {
+                $this->logDetail('site_unmarked_dry', $site['name'], '', null, 'dry-run — site #' . $site['id']);
+                continue;
+            }
+
+            $notes = $this->stripSiteMarker((string)$site['notes'], $tag);
+            db_execute_prepared(
+                'UPDATE sites SET name = ?, notes = ? WHERE id = ?',
+                [substr($cleanName, 0, 100), $notes, (int)$site['id']]
+            );
+            $this->logDetail('site_unmarked', $cleanName, '', null, 'un-flagged repopulated site #' . $site['id']);
+        }
+
+        $this->flushStats();
+    }
+
+    /**
+     * A site is a candidate when it holds no live devices — either it has no host
+     * rows at all, or every host referencing it is already tagged for deletion.
+     * Both cases get flagged so an operator can find and remove them manually.
+     */
+    private function markEmptySites(string $tag): void {
+        $like = '%' . $this->likeEscape($tag) . '%';
+
+        $sites = db_fetch_assoc_prepared(
+            "SELECT s.id, s.name, s.notes
+             FROM sites AS s
+             WHERE s.name NOT LIKE ?
+               AND NOT EXISTS (SELECT 1 FROM host h WHERE h.site_id = s.id AND h.description NOT LIKE ?)",
+            [$like, $like]
+        );
+
+        if (!cacti_sizeof($sites)) {
+            return;
+        }
+
+        foreach ($sites as $site) {
+            $this->stats['empty_sites_marked']++;
+
+            if ($this->dryRun) {
+                $this->logDetail('empty_site_dry', $site['name'], '', null, 'dry-run — site #' . $site['id']);
+                continue;
+            }
+
+            $newName = substr($tag . ' ' . $site['name'], 0, 100);
+            $marker  = $tag . ' empty (no live devices) ' . date('Y-m-d H:i');
+            $notes   = substr($marker . "\n" . rtrim((string)$site['notes']), 0, 1024);
+
+            db_execute_prepared(
+                'UPDATE sites SET name = ?, notes = ? WHERE id = ?',
+                [$newName, $notes, (int)$site['id']]
+            );
+
+            $this->logDetail('empty_site', $site['name'], '', null, 'flagged empty site #' . $site['id']);
+        }
+
+        $this->flushStats();
+    }
+
+    /**
+     * Walk each managed tree bottom-up and flag the top-most header of every
+     * branch that contains no live content. A branch is empty when all of its
+     * descendants are either empty headers or leaf items pointing at devices that
+     * are tagged for deletion (or no longer exist). Only the outermost empty
+     * header of a subtree is flagged, so removing it takes the whole branch.
+     */
+    private function markEmptyTreeItems(string $tag): void {
+        // Scope strictly to the trees this profile places devices into (tree,
+        // aggregate and OID rules). We never touch unmanaged trees — e.g. the
+        // default Local/Machine tree — so an empty header there is left alone.
+        $treeIds = [];
+        foreach ([$this->treeRules, $this->aggRules, $this->oidRules] as $ruleSet) {
+            foreach ($ruleSet as $rule) {
+                $tid = (int)($rule['tree_id'] ?? 0);
+                if ($tid) {
+                    $treeIds[$tid] = true;
+                }
+            }
+        }
+        if (empty($treeIds)) {
+            return;
+        }
+
+        foreach (array_keys($treeIds) as $treeId) {
+            $this->markEmptyTreeItemsForTree($treeId, $tag);
+        }
+    }
+
+    private function markEmptyTreeItemsForTree(int $treeId, string $tag): void {
+        $items = db_fetch_assoc_prepared(
+            'SELECT id, parent, title, host_id, local_graph_id
+             FROM graph_tree_items WHERE graph_tree_id = ?',
+            [$treeId]
+        );
+        if (!cacti_sizeof($items)) {
+            return;
+        }
+
+        // Index items and build a parent → children adjacency map.
+        $byId     = [];
+        $children = [];
+        foreach ($items as $it) {
+            $id            = (int)$it['id'];
+            $it['id']      = $id;
+            $it['parent']  = (int)($it['parent'] ?? 0);
+            $byId[$id]     = $it;
+            $children[$it['parent']][] = $id;
+        }
+
+        // Resolve which referenced devices are still "live". A leaf pointing at a
+        // tagged-for-deletion or missing host counts as removable content.
+        $hostIds = [];
+        foreach ($byId as $it) {
+            if ((int)$it['host_id'] > 0) {
+                $hostIds[(int)$it['host_id']] = true;
+            }
+        }
+        // Graph leaves resolve to their owning host via graph_local.
+        $graphIds = [];
+        foreach ($byId as $it) {
+            if ((int)$it['local_graph_id'] > 0) {
+                $graphIds[(int)$it['local_graph_id']] = true;
+            }
+        }
+        $graphHost = [];
+        if (!empty($graphIds)) {
+            $ph   = implode(',', array_fill(0, count($graphIds), '?'));
+            $rows = db_fetch_assoc_prepared(
+                "SELECT id, host_id FROM graph_local WHERE id IN ($ph)",
+                array_keys($graphIds)
+            );
+            if (cacti_sizeof($rows)) {
+                foreach ($rows as $row) {
+                    $graphHost[(int)$row['id']] = (int)$row['host_id'];
+                    if ((int)$row['host_id'] > 0) {
+                        $hostIds[(int)$row['host_id']] = true;
+                    }
+                }
+            }
+        }
+
+        // A host is "live" only if it exists and is NOT tagged for deletion.
+        $liveHost = [];
+        if (!empty($hostIds)) {
+            $ph   = implode(',', array_fill(0, count($hostIds), '?'));
+            $rows = db_fetch_assoc_prepared(
+                "SELECT id, description FROM host WHERE id IN ($ph)",
+                array_keys($hostIds)
+            );
+            if (cacti_sizeof($rows)) {
+                foreach ($rows as $row) {
+                    $liveHost[(int)$row['id']] = (strpos((string)$row['description'], $tag) === false);
+                }
+            }
+        }
+
+        // Bottom-up removability, memoised. A leaf is removable when its device is
+        // gone/tagged; a header is removable when all its children are removable.
+        $removable = [];
+        $resolve = function (int $id) use (&$resolve, &$removable, $byId, $children, $liveHost, $graphHost): bool {
+            if (isset($removable[$id])) {
+                return $removable[$id];
+            }
+            $removable[$id] = false; // cycle guard (defensive; trees are acyclic)
+            $it = $byId[$id];
+
+            if ((int)$it['host_id'] > 0) {
+                // Live host → keep; tagged/missing host → removable.
+                return $removable[$id] = empty($liveHost[(int)$it['host_id']]);
+            }
+            if ((int)$it['local_graph_id'] > 0) {
+                $hid = $graphHost[(int)$it['local_graph_id']] ?? 0;
+                // Removable only when we can prove the owning host is gone/tagged.
+                return $removable[$id] = ($hid > 0 && empty($liveHost[$hid]));
+            }
+
+            // Header: removable when it has no children, or all children are.
+            $kids = $children[$id] ?? [];
+            foreach ($kids as $kid) {
+                if (!$resolve($kid)) {
+                    return $removable[$id] = false;
+                }
+            }
+            return $removable[$id] = true;
+        };
+        foreach (array_keys($byId) as $id) {
+            $resolve($id);
+        }
+
+        // Reconcile the tag on every header:
+        //  • non-empty + tagged  → un-flag (a returning device repopulated it),
+        //  • empty     + untagged → flag the top-most removable header of the
+        //                           subtree (a removable header whose parent is
+        //                           not itself removable).
+        foreach ($byId as $id => $it) {
+            $isHeader = ((int)$it['host_id'] === 0 && (int)$it['local_graph_id'] === 0);
+            if (!$isHeader) {
+                continue;
+            }
+            $title  = (string)$it['title'];
+            $tagged = (strpos($title, $tag) !== false);
+
+            if (empty($removable[$id])) {
+                // Header holds live content — remove any stale flag.
+                if (!$tagged) {
+                    continue;
+                }
+                $clean = $this->stripTag($title, $tag);
+                if ($clean === $title) {
+                    continue; // tag not a title prefix — leave alone
+                }
+
+                $this->stats['trees_unmarked']++;
+
+                if ($this->dryRun) {
+                    $this->logDetail('tree_unmarked_dry', $title, '', null, 'dry-run — tree #' . $treeId . ' item #' . $id);
+                    continue;
+                }
+                db_execute_prepared(
+                    'UPDATE graph_tree_items SET title = ? WHERE id = ?',
+                    [substr($clean, 0, 255), $id]
+                );
+                $this->logDetail('tree_unmarked', $clean, '', null, 'un-flagged repopulated branch — tree #' . $treeId . ' item #' . $id);
+                continue;
+            }
+
+            // Header is empty.
+            if ($tagged) {
+                continue; // already flagged on a previous run
+            }
+            $parent = (int)$it['parent'];
+            if ($parent !== 0 && !empty($removable[$parent]) && isset($byId[$parent])) {
+                continue; // an ancestor header will be flagged instead
+            }
+
+            $this->stats['empty_trees_marked']++;
+
+            if ($this->dryRun) {
+                $this->logDetail('empty_tree_dry', $title, '', null, 'dry-run — tree #' . $treeId . ' item #' . $id);
+                continue;
+            }
+
+            $newTitle = substr($tag . ' ' . $title, 0, 255);
+            db_execute_prepared(
+                'UPDATE graph_tree_items SET title = ? WHERE id = ?',
+                [$newTitle, $id]
+            );
+            $this->logDetail('empty_tree', $title, '', null, 'flagged empty branch — tree #' . $treeId . ' item #' . $id);
+        }
+
+        $this->flushStats();
+    }
+
+    /** Escape LIKE wildcards so a deletion_tag containing % or _ still matches literally. */
+    private function likeEscape(string $s): string {
+        return addcslashes($s, '\\%_');
+    }
+
+    /** Strip a leading deletion tag (and the following whitespace) from a string. */
+    private function stripTag(string $s, string $tag): string {
+        if ($tag !== '' && strncmp($s, $tag, strlen($tag)) === 0) {
+            return ltrim(substr($s, strlen($tag)));
+        }
+        return $s;
+    }
+
+    /** Drop the "<tag> empty (…)" marker line the empty-site flag appended to notes. */
+    private function stripSiteMarker(string $notes, string $tag): string {
+        if ($notes === '') {
+            return $notes;
+        }
+        $kept = [];
+        foreach (preg_split('/\r\n|\r|\n/', $notes) as $line) {
+            if (strncmp($line, $tag . ' empty', strlen($tag) + 6) === 0) {
+                continue;
+            }
+            $kept[] = $line;
+        }
+        return trim(implode("\n", $kept));
     }
 
     // ─── Run tracking ─────────────────────────────────────────────────────────
@@ -1385,7 +1885,9 @@ class CereusDatasyncEngine {
              SET excel_total = ?, excel_raw_total = ?, excel_skipped_load = ?,
                  cacti_total = ?, added = ?, updated = ?,
                  marked_deleted = ?, skipped = ?, failed = ?,
-                 tree_placed = ?, graphs_found = ?, graphs_created = ?
+                 tree_placed = ?, graphs_found = ?, graphs_created = ?,
+                 empty_sites_marked = ?, empty_trees_marked = ?,
+                 sites_unmarked = ?, trees_unmarked = ?
              WHERE id = ?',
             [
                 $this->stats['excel_total'],        $this->stats['excel_raw_total'],
@@ -1395,6 +1897,8 @@ class CereusDatasyncEngine {
                 $this->stats['skipped'],            $this->stats['failed'],
                 $this->stats['tree_placed'],        $this->stats['graphs_found'],
                 $this->stats['graphs_created'],
+                $this->stats['empty_sites_marked'], $this->stats['empty_trees_marked'],
+                $this->stats['sites_unmarked'],     $this->stats['trees_unmarked'],
                 $this->runId,
             ]
         );
@@ -1432,7 +1936,9 @@ class CereusDatasyncEngine {
                  excel_total = ?, excel_raw_total = ?, excel_skipped_load = ?,
                  cacti_total = ?, added = ?, updated = ?,
                  marked_deleted = ?, skipped = ?, failed = ?,
-                 tree_placed = ?, graphs_found = ?, graphs_created = ?
+                 tree_placed = ?, graphs_found = ?, graphs_created = ?,
+                 empty_sites_marked = ?, empty_trees_marked = ?,
+                 sites_unmarked = ?, trees_unmarked = ?
              WHERE id = ?',
             [
                 $status, $error,
@@ -1443,6 +1949,8 @@ class CereusDatasyncEngine {
                 $this->stats['skipped'],            $this->stats['failed'],
                 $this->stats['tree_placed'],        $this->stats['graphs_found'],
                 $this->stats['graphs_created'],
+                $this->stats['empty_sites_marked'], $this->stats['empty_trees_marked'],
+                $this->stats['sites_unmarked'],     $this->stats['trees_unmarked'],
                 $this->runId,
             ]
         );

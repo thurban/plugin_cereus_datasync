@@ -5,6 +5,94 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-10
+
+### Added
+- **Operator-defined branch path on tree rule templates.** The tree branch a
+  generated automation rule points at was fixed at Region / Country / Site. Each
+  template now carries its own *branch path* — a `/`-separated list of levels,
+  each either literal text or one of the `{region}` `{country}` `{site}`
+  placeholders — so the hierarchy is chosen per template:
+  `{region}/{country}/{site}`, `{region}/{country}`, `{site}`, or a fixed
+  collector branch such as `Internet` or `Internet/{region}`. A level whose
+  placeholder is empty for a device is skipped, so a device with no country
+  still lands one level up instead of under a blank branch.
+  Existing templates are migrated to `{region}/{country}/{site}`, which
+  reproduces their previous branches and rule names exactly — no tree churn on
+  upgrade.
+- Locations that resolve to the same branch with the same conditions now share
+  one generated rule rather than rebuilding it once per location, which is what
+  makes a shallow or literal path collect graphs from many sites into a single
+  branch. Where a fixed path is combined with a location-specific condition
+  (such as `{site_id}`), the rules are kept apart by name instead of
+  overwriting one another.
+
+## [1.4.0] - 2026-07-24
+
+### Added
+- **Delete empty containers on device deletion.** The core Console → Devices
+  delete-confirmation screen now offers an extra opt-in checkbox: *"Also delete
+  any associated Site(s) and Tree branch(es) that become empty"*. When ticked,
+  after the device(s) are removed the plugin deletes any Site left with no live
+  devices and prunes any tree branch (header) left with no children — walking
+  upward so a chain of now-empty parent headers is removed in one pass.
+  Containers that still hold another live device are never touched. The option
+  is delivered entirely through Cacti's hook API (`device_remove` snapshots the
+  containers before deletion; `device_action_bottom` prunes the empty ones
+  afterwards) with no core modification, and is gated to Professional tier and
+  above. This complements the existing sync-time *empty container flagging*: the
+  sync flags containers for manual review, while this removes them immediately
+  on an operator-driven device delete.
+
+## [1.3.0] - 2026-07-22
+
+### Fixed
+- **Tree not updated when a device's office changes.** Tree placement previously
+  ran only when a device was first added. When an existing device moved to a
+  different location/site the sync updated its location and site but left it in
+  its old tree branch (and could leave it in both). The update path now
+  reconciles tree placement: the device is removed from any of the profile's
+  managed rule-parents that no longer match and added under every rule that
+  matches its new location. Only parents referenced by the profile's own tree
+  rules are touched — manual placements are left alone.
+- **Device wrongly marked for deletion when its name changed but its IP did not.**
+  The "still present in the inventory?" check compared against a device field
+  (`ip`) that does not exist on the loaded rows, so it could only match by
+  friendly name. A device whose SolarWinds hostname changed while its IP stayed
+  the same failed the check and was tagged for deletion (then revived by the
+  update pass — inflating counts and logging a false deletion). The check now
+  matches on the device's actual network address, so the rename is applied
+  cleanly as an update with no spurious deletion.
+
+### Added
+- **Empty container flagging.** After a sync tags devices for deletion (devices
+  no longer present in the source inventory), the run now flags the containers
+  those devices left behind so an operator can find and remove them manually in
+  the same pass:
+  - **Empty sites** — any site with no live devices (either no host rows at all,
+    or every host already tagged for deletion) has the deletion tag prefixed onto
+    its name and a dated note appended.
+  - **Empty tree branches** — the top-most tree header of any branch left with no
+    live devices is prefixed with the deletion tag. Only the outermost empty
+    header of a subtree is flagged, so removing it takes the whole branch. Marking
+    is scoped to the trees the profile actually places devices into.
+  - **Automatic tag removal.** Because deletion is manual, a flagged site or
+    branch can still be present when a later sync adds devices to that location
+    again. The sync now reuses the still-existing flagged container (rather than
+    creating a duplicate) and strips the deletion tag off any site/branch that is
+    populated with live devices again — the flag is reconciled against actual
+    contents on every run.
+  - Two profile toggles, **Flag Empty Sites** and **Flag Empty Tree Branches**
+    (both on by default), control the behaviour. Dry runs count candidates
+    without modifying anything. New run counters and result cards (*Empty Sites*,
+    *Empty Branches*, *Sites Revived*, *Branches Revived*) surface the outcome in
+    the run log.
+- **Device change tracking in notes.** When a sync updates a device's description
+  or its location/site, it now appends a timestamped, human-readable entry to the
+  device's Notes field (e.g. `[Data Sync 2026-07-22 09:14] Location: 'Berlin' →
+  'Munich'`), so every change made by the sync is visible on the device itself.
+  The field is bounded to keep repeated syncs from growing it without limit.
+
 ## [1.2.0] - 2026-07-07
 
 ### Added

@@ -199,8 +199,8 @@ switch ($action) {
 
         $maxOrder = (int)db_fetch_cell_prepared('SELECT COALESCE(MAX(rule_order), 0) FROM plugin_cds_tree_rules WHERE profile_id = ?', [$pid]);
         db_execute_prepared(
-            "INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, leaf_type, host_grouping)
-             VALUES (?, ?, 'on', 'New Template', 0, 2, 1)",
+            "INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, leaf_type, host_grouping, branch_path)
+             VALUES (?, ?, 'on', 'New Template', 0, 2, 1, '{region}/{country}/{site}')",
             [$pid, $maxOrder + 10]
         );
         print json_encode(['id' => (int)db_fetch_insert_id()]);
@@ -215,13 +215,14 @@ switch ($action) {
 
         db_execute_prepared(
             'UPDATE plugin_cds_tree_rules
-             SET name = ?, tree_id = ?, leaf_type = ?, host_grouping = ?, enabled = ?
+             SET name = ?, tree_id = ?, leaf_type = ?, host_grouping = ?, branch_path = ?, enabled = ?
              WHERE id = ? AND profile_id = ?',
             [
                 substr(trim(get_nfilter_request_var('name', 'Template')), 0, 128),
                 (int)get_filter_request_var('tree_id', FILTER_VALIDATE_INT),
                 (int)get_filter_request_var('leaf_type', FILTER_VALIDATE_INT) ?: 2,
                 (int)get_filter_request_var('host_grouping', FILTER_VALIDATE_INT) ?: 1,
+                substr(trim(get_nfilter_request_var('branch_path', '')), 0, 255),
                 (get_nfilter_request_var('enabled', '') === 'on') ? 'on' : '',
                 $ruleId, $pid,
             ]

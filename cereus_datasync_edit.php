@@ -78,6 +78,8 @@ function cereus_datasync_save(): void {
         'default_poller_id'     => (int)get_nfilter_request_var('default_poller_id', 1),
         'deletion_tag'          => trim(get_nfilter_request_var('deletion_tag', '[TO BE DELETED]')) ?: '[TO BE DELETED]',
         'deletion_skip_localhost'=> isset($_POST['deletion_skip_localhost']) ? 1 : 0,
+        'mark_empty_sites'      => isset($_POST['mark_empty_sites']) ? 1 : 0,
+        'mark_empty_tree_items' => isset($_POST['mark_empty_tree_items']) ? 1 : 0,
         'auto_create_graphs'    => isset($_POST['auto_create_graphs']) ? 1 : 0,
         'graph_query_type_id'   => (int)get_nfilter_request_var('graph_query_type_id', 0),
         'auto_graph_rules'      => isset($_POST['auto_graph_rules']) ? 1 : 0,
@@ -137,6 +139,7 @@ function cereus_datasync_edit_form(int $id): void {
         'default_availability' => 2, 'default_ping_method' => 2,
         'default_poller_id' => 1,
         'deletion_tag' => '[TO BE DELETED]', 'deletion_skip_localhost' => 1,
+        'mark_empty_sites' => 1, 'mark_empty_tree_items' => 1,
         'auto_create_graphs' => 0, 'graph_query_type_id' => 0, 'auto_graph_rules' => 0,
     ];
     $r = array_merge($defaults, $row ?: []);
@@ -387,6 +390,16 @@ function cereus_datasync_edit_form(int $id): void {
             'friendly_name' => __('Skip Localhost', 'cereus_datasync'),
             'description'   => __('Never mark the "localhost" device for deletion.', 'cereus_datasync'),
             'method'        => 'checkbox', 'value' => $r['deletion_skip_localhost'] ? 'on' : '',
+        ],
+        'mark_empty_sites' => [
+            'friendly_name' => __('Flag Empty Sites', 'cereus_datasync'),
+            'description'   => __('After a sync, prefix the tag onto any site whose devices are all tagged for deletion, so the now-empty site is easy to find and remove manually.', 'cereus_datasync'),
+            'method'        => 'checkbox', 'value' => $r['mark_empty_sites'] ? 'on' : '',
+        ],
+        'mark_empty_tree_items' => [
+            'friendly_name' => __('Flag Empty Tree Branches', 'cereus_datasync'),
+            'description'   => __('After a sync, prefix the tag onto the top-most tree header of any branch left with no live devices, so empty branches are easy to find and remove manually.', 'cereus_datasync'),
+            'method'        => 'checkbox', 'value' => $r['mark_empty_tree_items'] ? 'on' : '',
         ],
     ]]);
     html_end_box();

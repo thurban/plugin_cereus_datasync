@@ -34,7 +34,17 @@ A commercial [Cereus](https://urban-software.de) plugin for
   template defines its own **branch path**, so you choose the hierarchy the rule
   builds — `{region}/{country}/{site}`, `{region}/{country}`, `{site}`, or a
   fixed collector branch such as `Internet/{region}` that gathers matching
-  graphs from every site into one place.
+  graphs from every site into one place. Locations that land on the same branch
+  with the same conditions share one rule.
+- **Auto-created branch paths** — rule templates and aggregate rules name their
+  target branch as a path such as `EMEA/Germany/Munich`, and any header in that
+  path that does not exist yet is created during the run. Use `\/` for a literal
+  slash inside one header name; leave a template's path blank to build the
+  branch from Region / Country / Site.
+- **Co-requisite rule templates** — graph templates that share a group name are
+  placed as a unit: at a location, their tree rules, branch and graph placements
+  are created only when every template in the group matches at least one graph
+  there (e.g. an Internet graph only where an AnyConnect graph also exists).
 - **Aggregate graph rules** — build/rebuild aggregate graphs from all member
   graphs matching a graph template, an unbounded list of device match
   conditions (**AND**/**OR** connectors with parenthesis grouping), and an
@@ -59,12 +69,15 @@ at least a **Professional** licence.
 ## Requirements
 
 - Cacti 1.2.0 or newer
-- PHP 8.0+
+- PHP 7.4+ with the `zip` and `xml` extensions
 - Cereus License Manager plugin (Professional or Enterprise)
 
 ## Installation
 
-1. Copy this directory to `<cacti>/plugins/cereus_datasync/`.
+1. Copy this directory to `<cacti>/plugins/cereus_datasync/`, including
+   `vendor/` (PhpSpreadsheet) and `lib/sync/`; the plugin needs nothing from
+   Cacti's `cli/` directory. To rebuild `vendor/`, run `composer install` in the
+   plugin directory.
 2. In Cacti, go to **Console → Configuration → Plugins** and install/enable
    **Cereus Data Sync**.
 3. Grant the *Plugin: Cereus Data Sync* realm to the appropriate user groups.

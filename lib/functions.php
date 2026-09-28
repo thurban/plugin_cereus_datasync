@@ -111,8 +111,8 @@ function cereus_datasync_copy_profile(int $id): int {
     if (cacti_sizeof($rules)) {
         foreach ($rules as $r) {
             db_execute_prepared(
-                'INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, leaf_type, host_grouping) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [$newId, (int)$r['rule_order'], $r['enabled'], $r['name'], (int)$r['tree_id'], (int)$r['leaf_type'], (int)$r['host_grouping']]
+                'INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, branch_path, leaf_type, host_grouping, require_group) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$newId, (int)$r['rule_order'], $r['enabled'], $r['name'], (int)$r['tree_id'], $r['branch_path'] ?? '', (int)$r['leaf_type'], (int)$r['host_grouping'], $r['require_group'] ?? '']
             );
             $newRuleId = (int)db_fetch_insert_id();
 
@@ -144,10 +144,10 @@ function cereus_datasync_copy_profile(int $id): int {
             db_execute_prepared(
                 'INSERT INTO plugin_cds_aggregate_rules
                     (profile_id, rule_order, enabled, name, graph_template_id, aggregate_template_id,
-                     tree_id, tree_item_id, placement_mode, site_name,
+                     tree_id, tree_item_id, branch_path, placement_mode, site_name,
                      device_match_field, device_match_pattern,
                      graph_title_pattern, result_graph_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                 [
                     $newId,
                     (int)$ar['rule_order'],
@@ -157,6 +157,7 @@ function cereus_datasync_copy_profile(int $id): int {
                     (int)$ar['aggregate_template_id'],
                     (int)$ar['tree_id'],
                     (int)$ar['tree_item_id'],
+                    $ar['branch_path'] ?? '',
                     (int)($ar['placement_mode'] ?? 0),
                     $ar['site_name'] ?? '',
                     $ar['device_match_field'],
@@ -236,6 +237,158 @@ function cereus_datasync_delete_function_map(int $mapId, int $profileId): void {
 }
 
 // ─── Tree rule helpers ────────────────────────────────────────────────────────
+
+/**
+ * Split a branch path such as "EMEA/Germany/Munich" into its header segments.
+ * A backslash escapes a literal separator, so a header genuinely named
+ * "Traffic In/Out" is written "Traffic In\/Out".  Empty segments are dropped,
+ * which makes a stray leading, trailing or doubled "/" harmless.
+ */
+function cereus_datasync_split_branch_path(string $path): array {
+    $segments = [];
+    $current  = '';
+    $length   = strlen($path);
+
+    for ($i = 0; $i < $length; $i++) {
+        if ($path[$i] === '\\' && isset($path[$i + 1]) && $path[$i + 1] === '/') {
+            $current .= '/';
+            $i++;
+        } elseif ($path[$i] === '/') {
+            $segments[] = $current;
+            $current    = '';
+        } else {
+            $current .= $path[$i];
+        }
+    }
+    $segments[] = $current;
+
+    $result = [];
+    foreach ($segments as $segment) {
+        $segment = trim($segment);
+        if ($segment !== '') {
+            $result[] = cereus_datasync_truncate_title($segment);
+        }
+    }
+
+    return $result;
+}
+
+// graph_tree_items.title is VARCHAR(255) — count characters, not bytes, so a
+// multi-byte site name is never cut mid-character.
+function cereus_datasync_truncate_title(string $title): string {
+    return function_exists('mb_substr') ? mb_substr($title, 0, 255) : substr($title, 0, 255);
+}
+
+/**
+ * Find one header node under $parentId, creating it when it is not there yet.
+ * Returns its graph_tree_items.id, or 0 if the insert failed.
+ */
+function cereus_datasync_find_or_create_branch(int $treeId, int $parentId, string $title, string $deletionTag = ''): int {
+    if ($title === '') return $parentId;
+
+    $id = (int)db_fetch_cell_prepared(
+        'SELECT id FROM graph_tree_items
+         WHERE graph_tree_id = ? AND parent = ? AND title = ?
+           AND local_graph_id = 0 AND host_id = 0',
+        [$treeId, $parentId, $title]
+    );
+
+    if ($id) return $id;
+
+    // Reuse a branch an earlier run flagged as empty (the profile's deletion tag
+    // is prefixed onto the title) rather than creating a duplicate next to it;
+    // the reconciliation pass strips the tag once it holds live devices again.
+    $deletionTag = trim($deletionTag);
+    if ($deletionTag !== '') {
+        $id = (int)db_fetch_cell_prepared(
+            'SELECT id FROM graph_tree_items
+             WHERE graph_tree_id = ? AND parent = ? AND title = ?
+               AND local_graph_id = 0 AND host_id = 0',
+            [$treeId, $parentId, cereus_datasync_truncate_title($deletionTag . ' ' . $title)]
+        );
+        if ($id) return $id;
+    }
+
+    // Direct insert — avoids form_input_validate side-effects in CLI/poller context
+    db_execute_prepared(
+        'INSERT INTO graph_tree_items
+            (graph_tree_id, title, parent, position,
+             local_graph_id, host_id, site_id,
+             host_grouping_type, sort_children_type)
+         VALUES (?, ?, ?, 0, 0, 0, 0, 0, 1)',
+        [$treeId, $title, $parentId]
+    );
+
+    return (int)db_fetch_insert_id();
+}
+
+/**
+ * Resolve a branch path to a graph_tree_items.id, creating every header along
+ * the way that does not exist yet.  An empty path means the tree root, which is
+ * what 0 denotes to Cacti; 0 also comes back when a segment could not be
+ * created, so the caller places at the root rather than losing the item.
+ */
+function cereus_datasync_resolve_branch_path(int $treeId, string $path, string $deletionTag = ''): int {
+    if (!$treeId) return 0;
+
+    $parentId = 0;
+    foreach (cereus_datasync_split_branch_path($path) as $title) {
+        $parentId = cereus_datasync_find_or_create_branch($treeId, $parentId, $title, $deletionTag);
+        if (!$parentId) break;
+    }
+
+    return $parentId;
+}
+
+/**
+ * Look a branch path up without creating anything.  Returns the tree item id,
+ * 0 for the tree root, or -1 when the path does not exist — which lets a caller
+ * that only wants to inspect an existing branch tell "root" from "not there".
+ */
+function cereus_datasync_lookup_branch_path(int $treeId, string $path): int {
+    if (!$treeId) return 0;
+
+    $parentId = 0;
+    foreach (cereus_datasync_split_branch_path($path) as $title) {
+        $parentId = (int)db_fetch_cell_prepared(
+            'SELECT id FROM graph_tree_items
+             WHERE graph_tree_id = ? AND parent = ? AND title = ?
+               AND local_graph_id = 0 AND host_id = 0',
+            [$treeId, $parentId, $title]
+        );
+        if (!$parentId) return -1;
+    }
+
+    return $parentId;
+}
+
+/**
+ * Render an existing header node as a "/"-joined branch path.  Used to migrate
+ * rules that stored a node id onto the new text field.  Returns '' for the tree
+ * root or an unknown node.
+ */
+function cereus_datasync_branch_path_for_item(int $treeId, int $itemId): string {
+    $segments = [];
+    $guard    = 0;
+
+    while ($itemId > 0 && $guard++ < 64) {
+        $row = db_fetch_row_prepared(
+            'SELECT parent, title FROM graph_tree_items WHERE id = ? AND graph_tree_id = ?',
+            [$itemId, $treeId]
+        );
+        if (!cacti_sizeof($row)) break;
+
+        $title = trim((string)$row['title']);
+        if ($title !== '') {
+            array_unshift($segments, str_replace('/', '\\/', $title));
+        }
+
+        $itemId = (int)$row['parent'];
+    }
+
+    return implode('/', $segments);
+}
+
 
 // ─── Rule template helpers ────────────────────────────────────────────────────
 

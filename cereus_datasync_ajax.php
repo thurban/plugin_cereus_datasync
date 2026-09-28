@@ -22,6 +22,26 @@ require('./include/auth.php');
 require_once(__DIR__ . '/lib/license_check.php');
 require_once(__DIR__ . '/lib/functions.php');
 
+/**
+ * Tree id posted by an autosave, falling back to the value already stored.
+ *
+ * The tree dropdowns open on "-- Select Tree --" (value 0), and every field on
+ * these pages saves the whole row on blur. A save that fires while a dropdown
+ * has not been re-selected would otherwise overwrite a configured tree with 0
+ * and silently disable the rule, so 0 is read as "unchanged" rather than as a
+ * target. Clearing a tree is done by deleting the rule.
+ */
+function cereus_datasync_posted_tree_id(string $table, int $ruleId, int $profileId): int {
+    $posted = (int)get_filter_request_var('tree_id', FILTER_VALIDATE_INT);
+    if ($posted > 0) return $posted;
+
+    // Table name is a literal from the call sites below, never request data.
+    return (int)db_fetch_cell_prepared(
+        "SELECT tree_id FROM $table WHERE id = ? AND profile_id = ?",
+        [$ruleId, $profileId]
+    );
+}
+
 // Release the PHP session lock so other requests in the same browser session
 // are not blocked. Must happen after auth.php has written its session data.
 session_write_close();
@@ -199,8 +219,8 @@ switch ($action) {
 
         $maxOrder = (int)db_fetch_cell_prepared('SELECT COALESCE(MAX(rule_order), 0) FROM plugin_cds_tree_rules WHERE profile_id = ?', [$pid]);
         db_execute_prepared(
-            "INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, leaf_type, host_grouping, branch_path)
-             VALUES (?, ?, 'on', 'New Template', 0, 2, 1, '{region}/{country}/{site}')",
+            "INSERT INTO plugin_cds_tree_rules (profile_id, rule_order, enabled, name, tree_id, leaf_type, host_grouping)
+             VALUES (?, ?, 'on', 'New Template', 0, 2, 1)",
             [$pid, $maxOrder + 10]
         );
         print json_encode(['id' => (int)db_fetch_insert_id()]);
@@ -215,14 +235,15 @@ switch ($action) {
 
         db_execute_prepared(
             'UPDATE plugin_cds_tree_rules
-             SET name = ?, tree_id = ?, leaf_type = ?, host_grouping = ?, branch_path = ?, enabled = ?
+             SET name = ?, tree_id = ?, branch_path = ?, leaf_type = ?, host_grouping = ?, require_group = ?, enabled = ?
              WHERE id = ? AND profile_id = ?',
             [
                 substr(trim(get_nfilter_request_var('name', 'Template')), 0, 128),
-                (int)get_filter_request_var('tree_id', FILTER_VALIDATE_INT),
+                cereus_datasync_posted_tree_id('plugin_cds_tree_rules', $ruleId, $pid),
+                substr(trim(get_nfilter_request_var('branch_path', '')), 0, 512),
                 (int)get_filter_request_var('leaf_type', FILTER_VALIDATE_INT) ?: 2,
                 (int)get_filter_request_var('host_grouping', FILTER_VALIDATE_INT) ?: 1,
-                substr(trim(get_nfilter_request_var('branch_path', '')), 0, 255),
+                substr(trim(get_nfilter_request_var('require_group', '')), 0, 64),
                 (get_nfilter_request_var('enabled', '') === 'on') ? 'on' : '',
                 $ruleId, $pid,
             ]
@@ -352,15 +373,15 @@ switch ($action) {
         db_execute_prepared(
             'UPDATE plugin_cds_aggregate_rules
              SET name = ?, graph_template_id = ?, aggregate_template_id = ?,
-                 tree_id = ?, tree_item_id = ?, placement_mode = ?, site_name = ?,
+                 tree_id = ?, branch_path = ?, placement_mode = ?, site_name = ?,
                  graph_title_pattern = ?, enabled = ?
              WHERE id = ? AND profile_id = ?',
             [
                 substr(trim(get_nfilter_request_var('name', 'New Aggregate')), 0, 128),
                 (int)get_filter_request_var('graph_template_id', FILTER_VALIDATE_INT),
                 (int)get_filter_request_var('aggregate_template_id', FILTER_VALIDATE_INT),
-                (int)get_filter_request_var('tree_id', FILTER_VALIDATE_INT),
-                (int)get_filter_request_var('tree_item_id', FILTER_VALIDATE_INT),
+                cereus_datasync_posted_tree_id('plugin_cds_aggregate_rules', $ruleId, $pid),
+                substr(trim(get_nfilter_request_var('branch_path', '')), 0, 512),
                 $pmode,
                 substr(trim(get_nfilter_request_var('site_name', '')), 0, 128),
                 substr(trim(get_nfilter_request_var('graph_title_pattern', '')), 0, 256),
@@ -481,7 +502,7 @@ switch ($action) {
                 substr(trim(get_nfilter_request_var('oid', '')), 0, 256),
                 $matchField,
                 substr(trim(get_nfilter_request_var('device_match_pattern', '')), 0, 256),
-                (int)get_filter_request_var('tree_id', FILTER_VALIDATE_INT),
+                cereus_datasync_posted_tree_id('plugin_cds_oid_rules', $ruleId, $pid),
                 (int)get_filter_request_var('tree_item_id', FILTER_VALIDATE_INT),
                 (get_nfilter_request_var('enabled', '') === 'on') ? 'on' : '',
                 $ruleId, $pid,

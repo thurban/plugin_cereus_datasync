@@ -1,12 +1,23 @@
 <?php
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Branch-path helpers are shared with the UI; poller_bottom loads this file on
+// its own, so pull them in here rather than relying on the caller.
+require_once __DIR__ . '/functions.php';
+
 class CereusDatasyncEngine {
 
     private array  $profile;
     private array  $colMaps   = [];
     private array  $funcMaps  = [];   // device_function => host_template_id
     private array  $treeRules = [];
+    private array  $treeRuleConds  = [];   // rule id => condition rows
+    private array  $treeRuleWarned = [];   // rule ids already logged as not evaluable
+    private array  $siteIdCache    = [];   // "region/country/site" => sites.id
+    private array  $reqGroups      = [];   // co-requisite group => member template ids
+    private array  $gatedRules     = [];   // group => location => template id => generated rule
+    private array  $materialised   = [];   // template id|rule signature => true, per rule pass
+    private array  $usedRuleNames  = [];   // generated rule name => rule signature, per rule pass
     private array  $aggRules  = [];
     private array  $oidRules  = [];
     private int    $runId     = 0;
@@ -133,7 +144,7 @@ class CereusDatasyncEngine {
                     $key = ($dev['region'] ?? '') . '|' . ($dev['country'] ?? '') . '|' . ($dev['site'] ?? '');
                     if (!isset($seenLocations[$key])) {
                         $seenLocations[$key] = true;
-                        $devMgr->getOrCreateSiteId(
+                        $this->getOrCreateSite($devMgr,
                             $dev['region']  ?? '',
                             $dev['country'] ?? '',
                             $dev['site']    ?? ''
@@ -191,7 +202,7 @@ class CereusDatasyncEngine {
                 if ($cactiDev) {
                     // Check description / location drift
                     $exLocation = substr($exDev['site'] ?? '', 0, 40);
-                    $exSiteId   = !$this->dryRun ? $devMgr->getOrCreateSiteId($exDev['region'], $exDev['country'], $exDev['site']) : 0;
+                    $exSiteId   = !$this->dryRun ? $this->getOrCreateSite($devMgr, $exDev['region'], $exDev['country'], $exDev['site']) : 0;
 
                     $descChanged = ($cactiDev['description'] !== $exDev['hostname']);
                     $locChanged  = ($cactiDev['location'] !== $exLocation || (!$this->dryRun && $cactiDev['site_id'] != $exSiteId));
@@ -339,6 +350,10 @@ class CereusDatasyncEngine {
             if (!$this->dryRun) {
                 $this->applyAggregateRules();
                 $this->applyOidGraphRules();
+
+                // Every graph of this run exists now, so co-requisite groups can
+                // finally be judged per location.
+                $this->applyCoRequisiteGroups();
             }
 
             // ── Flag containers left empty by this sync ────────────────────────
@@ -454,7 +469,7 @@ class CereusDatasyncEngine {
         foreach ($this->aggRules as $rule) {
             $graphTemplateId = (int)$rule['graph_template_id'];
             $treeId          = (int)$rule['tree_id'];
-            $treeItemId      = (int)$rule['tree_item_id'];
+            $treeItemId      = 0;   // resolved from the rule's branch path below
             $aggTemplateId   = (int)$rule['aggregate_template_id'];
             $titlePattern    = trim($rule['graph_title_pattern'] ?? '');
 
@@ -564,22 +579,20 @@ class CereusDatasyncEngine {
                 [$resultGraphId, (int)$rule['id']]
             );
 
-            // Resolve placement node — site mode finds/creates a header node by name
+            // Resolve the placement node. Fixed-node mode follows the rule's branch
+            // path; site mode targets a single header named after the site, which is
+            // the same thing expressed as a one-segment path — "/" inside the site
+            // name is escaped so it stays one header rather than splitting.
+            // Either way a header that is not there yet gets created.
             $placementMode = (int)($rule['placement_mode'] ?? 0);
             $siteName      = trim($rule['site_name'] ?? '');
-            if ($placementMode === 1 && $siteName !== '' && $treeId) {
-                $siteNodeId = (int)db_fetch_cell_prepared(
-                    "SELECT id FROM graph_tree_items
-                     WHERE graph_tree_id = ? AND title = ? AND local_graph_id = 0 AND host_id = 0 AND leaf_type = 1
-                     LIMIT 1",
-                    [$treeId, $siteName]
-                );
-                if (!$siteNodeId) {
-                    $siteNodeId = (int)api_tree_item_save(
-                        0, $treeId, TREE_ITEM_TYPE_HEADER, 0, $siteName, 0, 0, 0, 0, 1, false
-                    );
-                }
-                $treeItemId = $siteNodeId ?: 0;
+
+            if ($placementMode === 1) {
+                $treeItemId = ($siteName !== '')
+                    ? $this->resolveRuleBranch($treeId, str_replace('/', '\\/', $siteName))
+                    : 0;
+            } else {
+                $treeItemId = $this->resolveRuleBranch($treeId, (string)($rule['branch_path'] ?? ''));
             }
 
             // Place aggregate in tree (idempotent — skip if already there)
@@ -827,7 +840,7 @@ class CereusDatasyncEngine {
         }
 
         // Get or create site
-        $siteId = $devMgr->getOrCreateSiteId($device['region'], $device['country'], $device['site']);
+        $siteId = $this->getOrCreateSite($devMgr, $device['region'], $device['country'], $device['site']);
 
         $location = substr($device['site'] ?? '', 0, 40);
 
@@ -1055,16 +1068,41 @@ class CereusDatasyncEngine {
             }
         }
 
-        // Collect unique locations from the full Excel device set.
-        //
-        // $materialised and $usedNames live for the whole pass, not per location: a
-        // branch path that drops the site level (or is entirely literal) collapses
-        // many locations onto one branch, and without them the same rule would be
-        // rebuilt — and its conditions overwritten — once per location.
-        $seen         = [];
-        $materialised = [];
-        $usedNames    = [];
+        // A template whose parentheses do not balance can only produce a broken
+        // WHERE clause — build_rule_item_filter() concatenates the tokens verbatim
+        // and never checks — so drop it here. Writing it out would replace a
+        // working automation rule with one that errors for every device, and the
+        // breakage would show up as "no graphs placed" rather than as an error.
+        foreach ($templates as $tpl) {
+            $tplId = (int)$tpl['id'];
+            if (isset($conditions[$tplId]) && !$this->conditionsBalanced($conditions[$tplId])) {
+                $this->logDetail('auto_rule_skip', '', '', null,
+                    'Template "' . $tpl['name'] . '": unbalanced parentheses in its conditions — '
+                    . 'no automation rule generated. Balance every "(" with a matching ")".');
+                unset($conditions[$tplId]);
+            }
+        }
 
+        // Graph templates sharing a co-requisite group are placed as a unit, so
+        // remember every member — one that is misconfigured or skipped at a
+        // location must still hold the rest of its group back there.
+        $this->reqGroups  = [];
+        $this->gatedRules = [];
+
+        // These live for the whole pass, not per location: a branch path that drops
+        // the site level (or is entirely literal) collapses many locations onto one
+        // branch, and without them the same rule would be rebuilt — and its
+        // conditions overwritten — once per location.
+        $this->materialised  = [];
+        $this->usedRuleNames = [];
+        foreach ($templates as $tpl) {
+            if ($this->requireGroup($tpl) !== '') {
+                $this->reqGroups[$this->requireGroup($tpl)][] = (int)$tpl['id'];
+            }
+        }
+
+        // Collect unique locations from the full Excel device set
+        $seen = [];
         foreach ($excelDevices as $device) {
             $parts = array_values(array_filter([
                 trim($device['region']  ?? ''),
@@ -1079,36 +1117,26 @@ class CereusDatasyncEngine {
             foreach ($templates as $tpl) {
                 $tplConds = $conditions[(int)$tpl['id']] ?? [];
                 if (empty($tplConds)) continue;
-                $this->applyRuleTemplate($tpl, $tplConds, $device, $materialised, $usedNames);
+                $this->applyRuleTemplate($tpl, $tplConds, $parts, $device);
             }
         }
     }
 
-    /**
-     * Expand a template's branch_path into the ordered list of tree header titles.
-     * Segments split on "/", each one either literal text or built from the
-     * {region} {country} {site} placeholders. A segment that resolves to nothing is
-     * dropped, so "{region}/{country}/{site}" still degrades cleanly for a device
-     * with no country. An empty path falls back to the full location hierarchy,
-     * which is what every template did before the path became configurable.
-     */
-    private function resolveBranchPath(string $path, array $subs): array {
-        $path = trim($path);
-        if ($path === '') {
-            $path = '{region}/{country}/{site}';
+    // Parentheses must balance across the whole condition list, and a ")" may never
+    // precede its "(". build_rule_item_filter() does no validation of its own, so an
+    // unmatched bracket reaches MySQL as a syntax error.
+    private function conditionsBalanced(array $conditions): bool {
+        $depth = 0;
+        foreach ($conditions as $cond) {
+            $depth += max(0, (int)($cond['open_paren']  ?? 0));
+            $depth -= max(0, (int)($cond['close_paren'] ?? 0));
+            if ($depth < 0) return false;
         }
 
-        $titles = [];
-        foreach (explode('/', $path) as $segment) {
-            $title = trim(str_replace(array_keys($subs), array_values($subs), trim($segment)));
-            if ($title === '') continue;
-            $titles[] = substr($title, 0, 255);
-        }
-
-        return $titles;
+        return $depth === 0;
     }
 
-    private function applyRuleTemplate(array $tpl, array $conditions, array $device, array &$materialised, array &$usedNames): void {
+    private function applyRuleTemplate(array $tpl, array $conditions, array $locationParts, array $device): void {
         $treeId = (int)$tpl['tree_id'];
         if (!$treeId) return;
 
@@ -1119,9 +1147,11 @@ class CereusDatasyncEngine {
             trim($device['country'] ?? ''),
             trim($device['site']    ?? ''),
         ]));
-        $resolvedSiteId = (int)db_fetch_cell_prepared(
-            'SELECT id FROM sites WHERE name = ?', [$locationKey]
-        );
+        // A site an earlier sync flagged as empty still carries the deletion tag,
+        // and siteIdFor() finds it in that form too — otherwise {site_id} resolves
+        // to 0 for a returning location, and with a "contains" operator 0 matches
+        // every site id with a zero in it.
+        $resolvedSiteId = $this->deviceSiteId($device);
 
         // Substitution map — {site_id} enables exact integer matching on h.site_id,
         // which is more reliable than text matching on the truncated h.location field.
@@ -1133,71 +1163,89 @@ class CereusDatasyncEngine {
             '{site_id}'  => (string)$resolvedSiteId,
         ];
 
-        // Which branch does this template want for this location? Branch titles use
-        // the untruncated values — the 40-char clamp above exists only to match the
-        // truncated h.location column, and applying it here would rename the branches
-        // of any site with a long name.
-        $branchParts = $this->resolveBranchPath((string)($tpl['branch_path'] ?? ''), [
-            '{site}'     => trim($device['site']    ?? ''),
-            '{region}'   => trim($device['region']  ?? ''),
-            '{country}'  => trim($device['country'] ?? ''),
-            '{location}' => trim($device['site']    ?? ''),
-        ]);
-        if (empty($branchParts)) {
-            $this->logDetail('auto_rule', '', '', null,
-                'Skipped "' . $tpl['name'] . '" — branch path "' . trim((string)($tpl['branch_path'] ?? ''))
-                . '" resolved to nothing for location ' . ($locationKey !== '' ? $locationKey : '(none)'));
-            return;
-        }
+        // Never write a rule whose {site_id} could not be resolved: the placeholder
+        // would be substituted with 0 and the generated filter would match a wide
+        // swathe of unrelated sites instead of none.
+        if (!$resolvedSiteId) {
+            foreach ($conditions as $cond) {
+                if (strpos((string)$cond['pattern'], '{site_id}') !== false) {
+                    $this->logDetail('auto_rule_skip', '', '', null,
+                        'Template "' . $tpl['name'] . '" at "' . $locationKey . '": site not found, '
+                        . 'so {site_id} cannot be resolved — rule not generated');
 
-        // Resolve the conditions up front: together with the branch they decide the
-        // rule's identity, so two locations landing on the same branch with the same
-        // conditions produce one rule rather than two that overwrite each other.
-        $resolvedConds = [];
-        foreach ($conditions as $cond) {
-            $resolvedConds[] = [
-                'connector'   => (strtoupper($cond['connector'] ?? 'AND') === 'OR') ? 'OR' : 'AND',
-                'open_paren'  => max(0, (int)($cond['open_paren']  ?? 0)),
-                'close_paren' => max(0, (int)($cond['close_paren'] ?? 0)),
-                'field'       => $cond['field'],
-                'operator'    => (int)$cond['operator'],
-                'pattern'     => str_replace(array_keys($subs), array_values($subs), $cond['pattern']),
-            ];
-        }
-
-        $branchKey = implode(' / ', $branchParts);
-        $signature = md5($treeId . '|' . $branchKey . '|' . json_encode($resolvedConds));
-        $dedupKey  = (int)$tpl['id'] . '|' . $signature;
-        if (isset($materialised[$dedupKey])) return;
-        $materialised[$dedupKey] = true;
-
-        // Find or create the branch path in the target tree
-        $leafItemId = 0;
-        foreach ($branchParts as $title) {
-            $leafItemId = $this->findOrCreateBranch($treeId, $leafItemId, $title);
-            if (!$leafItemId) return;
+                    return;
+                }
+            }
         }
 
         $leafType    = (int)$tpl['leaf_type'] ?: 2;
         $hostGrouping = (int)$tpl['host_grouping'] ?: 1;
+        $items       = $this->buildRuleItems($conditions, $subs);
+        $group       = $this->requireGroup($tpl);
 
-        // Name the rule after the branch it fills. A template on the default path
-        // reproduces the pre-1.5.0 name exactly, so an upgraded profile reuses its
-        // existing rules instead of orphaning them.
+        $branch = $this->templateBranchTitles($tpl, $device, $locationParts);
+        if (empty($branch)) {
+            $this->logDetail('auto_rule_skip', '', '', null,
+                'Template "' . $tpl['name'] . '" at "' . $locationKey . '": branch path "'
+                . trim((string)($tpl['branch_path'] ?? '')) . '" resolved to nothing — rule not generated');
+
+            return;
+        }
+
+        // The branch and the resolved conditions together are the rule's identity:
+        // locations that land on the same branch with the same conditions share one
+        // rule instead of each writing — and overwriting — their own.
+        $branchKey = implode(' / ', $branch);
+        $signature = md5($treeId . '|' . $branchKey . '|' . json_encode($items));
+        $dedupKey  = (int)$tpl['id'] . '|' . $signature;
+        if (isset($this->materialised[$dedupKey])) return;
+        $this->materialised[$dedupKey] = true;
+
+        // Name the rule after the branch it fills. On the default path that is the
+        // location, so existing rules keep their names and are reused.
         $ruleName = substr('Auto[' . $tpl['name'] . ']: ' . $branchKey, 0, 255);
 
         // Same branch, different conditions — a literal path combined with a
         // location-specific condition such as {site_id}. Both rules are wanted, so
         // disambiguate rather than let the second overwrite the first.
-        if (isset($usedNames[$ruleName]) && $usedNames[$ruleName] !== $signature) {
+        if (isset($this->usedRuleNames[$ruleName]) && $this->usedRuleNames[$ruleName] !== $signature) {
             $ruleName = substr($ruleName . ' #' . $locationKey, 0, 255);
         }
-        $usedNames[$ruleName] = $signature;
+        $this->usedRuleNames[$ruleName] = $signature;
 
-        // Reuse the rule if it already exists (dedup by generated name), otherwise create it.
-        // Reuse lets edited conditions — including newly added OR/parenthesis grouping — take
-        // effect on the next sync instead of being permanently frozen at first creation.
-        $ruleId   = (int)db_fetch_cell_prepared(
+        // A co-requisite rule is not written yet: whether its location qualifies
+        // is only known once this run's graphs exist. applyCoRequisiteGroups()
+        // writes it — branch and all — only when the whole group matches.
+        if ($group !== '') {
+            $this->gatedRules[$group][implode('|', $locationParts)][(int)$tpl['id']] = [
+                'name'     => $ruleName,
+                'tpl'      => $tpl,
+                'branch'   => $branch,
+                'items'    => $items,
+                'tree_id'  => $treeId,
+                'leaf'     => $leafType,
+                'grouping' => $hostGrouping,
+            ];
+
+            return;
+        }
+
+        $leafItemId = $this->templateBranch($treeId, $branch);
+        if (!$leafItemId) return;
+
+        $ruleId = $this->saveTreeRule($ruleName, $treeId, $leafItemId, $leafType, $hostGrouping, $items);
+        if (!$ruleId) return;
+
+        $this->logDetail('auto_rule', '', '', null,
+            'Materialised "' . $ruleName . '" (rule_id=' . $ruleId . ', ' . count($items) . ' tokens)');
+    }
+
+    // Reuse the rule if it already exists (dedup by generated name), otherwise create it.
+    // Reuse lets edited conditions — including newly added OR/parenthesis grouping — take
+    // effect on the next sync instead of being permanently frozen at first creation.
+    // Returns the automation_tree_rules id, or 0 on failure.
+    private function saveTreeRule(string $ruleName, int $treeId, int $leafItemId, int $leafType, int $hostGrouping, array $items): int {
+        $ruleId = (int)db_fetch_cell_prepared(
             'SELECT id FROM automation_tree_rules WHERE name = ?',
             [$ruleName]
         );
@@ -1222,117 +1270,344 @@ class CereusDatasyncEngine {
             );
             $ruleId = (int)db_fetch_insert_id();
         }
-        if (!$ruleId) return;
+        if (!$ruleId) return 0;
 
-        // Materialise the conditions into a Cacti automation_match_rule_items token stream.
-        // Each plugin condition can carry a connector (AND/OR joining it to the previous
-        // condition) plus opening/closing parentheses, so one condition may expand into
-        // several tokens: [connector] [ '(' … ] <field op pattern> [ … ')' ]. Cacti's
-        // build_rule_item_filter() walks these tokens to assemble the WHERE clause, so the
-        // grouping "A AND ( B OR C OR D )" is reproduced faithfully.
-        $seq   = 1;
+        $seq = 1;
+        foreach ($items as $item) {
+            db_execute_prepared(
+                'INSERT INTO automation_match_rule_items
+                    (rule_id, rule_type, sequence, operation, field, operator, pattern)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [$ruleId, AUTOMATION_RULE_TYPE_TREE_MATCH, $seq++,
+                 $item['operation'], $item['field'], $item['operator'], $item['pattern']]
+            );
+        }
+
+        return $ruleId;
+    }
+
+    // Materialise the conditions into a Cacti automation_match_rule_items token stream.
+    // Each plugin condition can carry a connector (AND/OR joining it to the previous
+    // condition) plus opening/closing parentheses, so one condition may expand into
+    // several tokens: [connector] [ '(' … ] <field op pattern> [ … ')' ]. Cacti's
+    // build_rule_item_filter() walks these tokens to assemble the WHERE clause, so the
+    // grouping "A AND ( B OR C OR D )" is reproduced faithfully.
+    private function buildRuleItems(array $conditions, array $subs): array {
+        $items = [];
+        $token = function(int $operation, string $field, int $operator, string $patt) use (&$items) {
+            $items[] = ['operation' => $operation, 'field' => $field, 'operator' => $operator, 'pattern' => $patt];
+        };
+
         $first = true;
-        foreach ($resolvedConds as $cond) {
-            $pattern = $cond['pattern'];
-            $open    = $cond['open_paren'];
-            $close   = $cond['close_paren'];
-            $connOp  = ($cond['connector'] === 'OR') ? AUTOMATION_OPER_OR : AUTOMATION_OPER_AND;
-
-            $insertItem = function(int $operation, string $field, int $operator, string $patt) use (&$seq, $ruleId) {
-                db_execute_prepared(
-                    'INSERT INTO automation_match_rule_items
-                        (rule_id, rule_type, sequence, operation, field, operator, pattern)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [$ruleId, AUTOMATION_RULE_TYPE_TREE_MATCH, $seq++, $operation, $field, $operator, $patt]
-                );
-            };
+        foreach ($conditions as $cond) {
+            $pattern = str_replace(array_keys($subs), array_values($subs), $cond['pattern']);
+            $open    = max(0, (int)($cond['open_paren']  ?? 0));
+            $close   = max(0, (int)($cond['close_paren'] ?? 0));
+            $connOp  = (strtoupper($cond['connector'] ?? 'AND') === 'OR')
+                       ? AUTOMATION_OPER_OR : AUTOMATION_OPER_AND;
 
             if ($first) {
-                // First condition: no leading connector. Fold any opening bracket onto the
-                // field token if there is exactly one and no connector to sit before it.
+                // First condition: no leading connector.
                 for ($i = 0; $i < $open; $i++) {
-                    $insertItem(AUTOMATION_OPER_LEFT_BRACKET, '', 0, '');
+                    $token(AUTOMATION_OPER_LEFT_BRACKET, '', 0, '');
                 }
-                $insertItem(AUTOMATION_OPER_NULL, $cond['field'], (int)$cond['operator'], $pattern);
+                $token(AUTOMATION_OPER_NULL, $cond['field'], (int)$cond['operator'], $pattern);
             } elseif ($open == 0) {
                 // Common case — fold the connector directly onto the field token: "AND field …".
-                $insertItem($connOp, $cond['field'], (int)$cond['operator'], $pattern);
+                $token($connOp, $cond['field'], (int)$cond['operator'], $pattern);
             } else {
                 // Connector must precede the opening bracket(s): "AND ( field …".
-                $insertItem($connOp, '', 0, '');
+                $token($connOp, '', 0, '');
                 for ($i = 0; $i < $open; $i++) {
-                    $insertItem(AUTOMATION_OPER_LEFT_BRACKET, '', 0, '');
+                    $token(AUTOMATION_OPER_LEFT_BRACKET, '', 0, '');
                 }
-                $insertItem(AUTOMATION_OPER_NULL, $cond['field'], (int)$cond['operator'], $pattern);
+                $token(AUTOMATION_OPER_NULL, $cond['field'], (int)$cond['operator'], $pattern);
             }
 
             for ($i = 0; $i < $close; $i++) {
-                $insertItem(AUTOMATION_OPER_RIGHT_BRACKET, '', 0, '');
+                $token(AUTOMATION_OPER_RIGHT_BRACKET, '', 0, '');
             }
 
             $first = false;
         }
 
-        $this->logDetail('auto_rule', '', '', null,
-            'Materialised "' . $ruleName . '" (rule_id=' . $ruleId . ', ' . ($seq - 1) . ' tokens)');
+        return $items;
+    }
+
+    // Graphs a token stream would match, evaluated the way Cacti's
+    // get_matching_graphs() does but without a stored rule behind it.
+    private function matchingGraphIds(array $items): array {
+        if (!cacti_sizeof($items)) return [];
+
+        $rows = db_fetch_assoc('SELECT DISTINCT gl.id
+            FROM graph_local AS gl
+            INNER JOIN graph_templates_graph AS gtg
+            LEFT JOIN graph_templates AS gt
+            ON (gl.graph_template_id=gt.id)
+            LEFT JOIN host AS h
+            ON (gl.host_id=h.id)
+            LEFT JOIN host_template AS ht
+            ON (h.host_template_id=ht.id)
+            WHERE gl.id=gtg.local_graph_id AND ' . build_rule_item_filter($items), false);
+
+        return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
+    }
+
+    // The co-requisite group of a template. Only graph templates take part: a
+    // host template places the device itself, so there is no graph to require.
+    private function requireGroup(array $tpl): string {
+        if ((int)($tpl['leaf_type'] ?? 2) !== TREE_ITEM_TYPE_GRAPH) {
+            return '';
+        }
+
+        return trim((string)($tpl['require_group'] ?? ''));
+    }
+
+    // The header titles of a template's branch for one location. An explicit path
+    // wins; without one the branch is the device's region / country / site, as it
+    // always was. Placeholders take the untruncated values — the 40-char clamp on
+    // {site} exists only to match h.location and would rename long site branches —
+    // and a level whose placeholder is empty is dropped.
+    private function templateBranchTitles(array $tpl, array $device, array $locationParts): array {
+        $path = trim((string)($tpl['branch_path'] ?? ''));
+
+        if ($path === '') {
+            return array_map('cereus_datasync_truncate_title', $locationParts);
+        }
+
+        // A "/" inside a value is part of that one header, not a new level.
+        $subs = [];
+        foreach ($this->branchSubs($device) as $placeholder => $value) {
+            $subs[$placeholder] = str_replace('/', '\\/', $value);
+        }
+
+        return cereus_datasync_split_branch_path(str_replace(array_keys($subs), array_values($subs), $path));
+    }
+
+    // Find or create a branch in the target tree from its header titles.
+    // Returns the deepest header's tree item id, or 0 on failure.
+    private function templateBranch(int $treeId, array $titles): int {
+        $leafItemId = 0;
+        foreach ($titles as $title) {
+            $leafItemId = $this->findOrCreateBranch($treeId, $leafItemId, $title);
+            if (!$leafItemId) {
+                $this->logDetail('tree_error', '', '', null,
+                    'could not create branch "' . implode(' / ', $titles) . '" in tree #' . $treeId);
+
+                return 0;
+            }
+        }
+
+        return $leafItemId;
+    }
+
+    /**
+     * Write and apply the rules of co-requisite templates. At each location a
+     * group is written only when every member template matches at least one
+     * graph there: then its branch and Cacti tree rules are created and the
+     * matching graphs placed, and graphs created later are placed by Cacti as
+     * usual. Otherwise no branch and no rule are created, and a rule an earlier
+     * run wrote is deleted together with the placements it made.
+     */
+    private function applyCoRequisiteGroups(): void {
+        global $config;
+
+        if (empty($this->gatedRules)) return;
+
+        include_once $config['base_path'] . '/lib/api_automation.php';
+        include_once $config['base_path'] . '/lib/api_tree.php';
+
+        foreach ($this->gatedRules as $group => $locations) {
+            foreach ($locations as $location => $members) {
+                $matches = [];
+                $missing = [];
+
+                foreach ($this->reqGroups[$group] as $tplId) {
+                    if (!isset($members[$tplId])) {
+                        $missing[] = $tplId;
+                        continue;
+                    }
+
+                    $matches[$tplId] = $this->matchingGraphIds($members[$tplId]['items']);
+
+                    if (!cacti_sizeof($matches[$tplId])) {
+                        $missing[] = $tplId;
+                    }
+                }
+
+                $satisfied = empty($missing);
+                $placed    = 0;
+                $removed   = 0;
+
+                foreach ($members as $tplId => $m) {
+                    if ($satisfied) {
+                        $leafItemId = $this->templateBranch($m['tree_id'], $m['branch']);
+                        if (!$leafItemId) continue;
+
+                        $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items']);
+                        if (!$ruleId) continue;
+
+                        $rule = db_fetch_row_prepared('SELECT * FROM automation_tree_rules WHERE id = ?', [$ruleId]);
+
+                        foreach ($matches[$tplId] as $graphId) {
+                            $parent = create_all_header_nodes($graphId, $rule);
+                            if (!api_tree_graph_exists($m['tree_id'], $parent, $graphId)) {
+                                create_graph_node($graphId, $parent, $rule);
+                                $placed++;
+                            }
+                        }
+                    } else {
+                        $removed += $this->deleteTreeRule($m['name'], $m['items']);
+                    }
+                }
+
+                if ($satisfied) {
+                    $this->logDetail('auto_rule', '', '', null,
+                        'Co-requisite group "' . $group . '" at "' . str_replace('|', '/', $location) . '": all '
+                        . count($this->reqGroups[$group]) . ' templates match — rules written, ' . $placed . ' graph(s) placed');
+                } else {
+                    $names = [];
+                    foreach ($missing as $tplId) {
+                        $names[] = isset($members[$tplId]) ? $members[$tplId]['tpl']['name'] : ('#' . $tplId);
+                    }
+
+                    $this->logDetail('auto_rule_skip', '', '', null,
+                        'Co-requisite group "' . $group . '" at "' . str_replace('|', '/', $location) . '": no graph for '
+                        . implode(', ', $names) . ' — no rule or branch created'
+                        . ($removed ? ', ' . $removed . ' earlier placement(s) removed' : ''));
+                }
+            }
+        }
+    }
+
+    // Delete a generated tree rule, and take the graphs it placed out of its
+    // branch. Returns the number of tree items removed.
+    private function deleteTreeRule(string $ruleName, array $items): int {
+        $rule = db_fetch_row_prepared('SELECT id, tree_id, tree_item_id FROM automation_tree_rules WHERE name = ?', [$ruleName]);
+        if (!cacti_sizeof($rule)) return 0;
+
+        $removed = 0;
+        if ((int)$rule['tree_item_id'] > 0) {
+            $graphIds = $this->matchingGraphIds($items);
+            if (cacti_sizeof($graphIds)) {
+                $removed = $this->removeGraphsUnder((int)$rule['tree_id'], (int)$rule['tree_item_id'], $graphIds);
+            }
+        }
+
+        db_execute_prepared('DELETE FROM automation_match_rule_items WHERE rule_id = ?', [(int)$rule['id']]);
+        db_execute_prepared('DELETE FROM automation_tree_rule_items WHERE rule_id = ?', [(int)$rule['id']]);
+        db_execute_prepared('DELETE FROM automation_tree_rules WHERE id = ?', [(int)$rule['id']]);
+
+        return $removed;
+    }
+
+    // Delete the tree leaves of the given graphs anywhere below a branch.
+    // Returns the number of items removed.
+    private function removeGraphsUnder(int $treeId, int $branchId, array $graphIds): int {
+        $items = db_fetch_assoc_prepared(
+            'SELECT id, parent, local_graph_id FROM graph_tree_items WHERE graph_tree_id = ?',
+            [$treeId]
+        );
+
+        $children = [];
+        foreach ($items as $it) {
+            $children[(int)$it['parent']][] = $it;
+        }
+
+        $wanted  = array_flip(array_map('intval', $graphIds));
+        $removed = 0;
+        $queue   = [$branchId];
+
+        while (!empty($queue)) {
+            $parent = array_shift($queue);
+
+            foreach ($children[$parent] ?? [] as $it) {
+                if (isset($wanted[(int)$it['local_graph_id']])) {
+                    db_execute_prepared('DELETE FROM graph_tree_items WHERE id = ?', [(int)$it['id']]);
+                    $removed++;
+                } else {
+                    $queue[] = (int)$it['id'];
+                }
+            }
+        }
+
+        return $removed;
     }
 
     // Find an existing header branch or create a new one in the target tree.
     // Returns the branch's graph_tree_items.id, or 0 on failure.
     private function findOrCreateBranch(int $treeId, int $parentId, string $title): int {
-        if ($title === '') return $parentId;
-
-        $id = (int)db_fetch_cell_prepared(
-            'SELECT id FROM graph_tree_items
-             WHERE graph_tree_id = ? AND parent = ? AND title = ?
-               AND local_graph_id = 0 AND host_id = 0',
-            [$treeId, $parentId, $title]
+        return cereus_datasync_find_or_create_branch(
+            $treeId, $parentId, $title, (string)($this->profile['deletion_tag'] ?? '')
         );
-
-        if ($id) return $id;
-
-        // Reuse a previously flagged-empty branch (deletion tag prefixed onto the
-        // title) rather than creating a duplicate; the reconciliation pass removes
-        // the tag once the branch holds live devices again.
-        $tag = trim((string)($this->profile['deletion_tag'] ?? ''));
-        if ($tag !== '') {
-            $taggedTitle = substr($tag . ' ' . $title, 0, 255);
-            $id = (int)db_fetch_cell_prepared(
-                'SELECT id FROM graph_tree_items
-                 WHERE graph_tree_id = ? AND parent = ? AND title = ?
-                   AND local_graph_id = 0 AND host_id = 0',
-                [$treeId, $parentId, $taggedTitle]
-            );
-            if ($id) return $id;
-        }
-
-        // Direct insert — avoids form_input_validate side-effects in CLI/poller context
-        db_execute_prepared(
-            'INSERT INTO graph_tree_items
-                (graph_tree_id, title, parent, position,
-                 local_graph_id, host_id, site_id,
-                 host_grouping_type, sort_children_type)
-             VALUES (?, ?, ?, 0, 0, 0, 0, 0, 1)',
-            [$treeId, $title, $parentId]
-        );
-
-        return (int)db_fetch_insert_id();
     }
 
     /**
-     * Refresh the cached graph and data-source titles for one device.
-     *
+     * Resolve a rule's configured branch path to a tree item id, creating every
+     * header along the path that does not exist yet. $subs carries the
+     * {site}/{region}/{country} substitutions for per-device rules; a rule with a
+     * static path passes none. An empty path means the tree root, which is what 0
+     * denotes to Cacti.
+     */
+    private function resolveRuleBranch(int $treeId, string $path, array $subs = []): int {
+        $path = trim($path);
+        if ($path === '' || !$treeId) return 0;
+
+        if (!empty($subs)) {
+            $path = str_replace(array_keys($subs), array_values($subs), $path);
+        }
+
+        $itemId = cereus_datasync_resolve_branch_path(
+            $treeId, $path, (string)($this->profile['deletion_tag'] ?? '')
+        );
+
+        if (!$itemId) {
+            $this->logDetail('tree_error', '', '', null,
+                'could not create branch path "' . $path . '" in tree #' . $treeId . ' — placing at tree root');
+        }
+
+        return $itemId;
+    }
+
+    /**
+     * Look a rule's branch path up without creating anything. Returns the tree
+     * item id, 0 for the tree root, or -1 when the branch is not there — used by
+     * the reconciliation pass, which must not materialise headers for rules that
+     * do not match the device it is re-placing.
+     */
+    private function lookupRuleBranch(int $treeId, string $path, array $subs = []): int {
+        $path = trim($path);
+        if ($path === '' || !$treeId) return 0;
+
+        if (!empty($subs)) {
+            $path = str_replace(array_keys($subs), array_values($subs), $path);
+        }
+
+        return cereus_datasync_lookup_branch_path($treeId, $path);
+    }
+
+    // Placeholder map for a branch path, mirroring the substitutions available to
+    // a rule template's condition patterns so a path can follow the device.
+    private function branchSubs(array $device): array {
+        return [
+            '{region}'   => trim($device['region']  ?? ''),
+            '{country}'  => trim($device['country'] ?? ''),
+            '{site}'     => trim($device['site']    ?? ''),
+            '{location}' => trim($device['site']    ?? ''),
+        ];
+    }
+
+    /**
      * Cacti substitutes |host_description| / |host_location| once and stores the
      * result in graph_templates_graph.title_cache and data_template_data.name_cache.
-     * Nothing recomputes those columns when host.description changes — there is no
-     * database trigger, and the only refresh path in core is api_device_save()
-     * (lib/api_device.php), which this sync calls exclusively when adding a device.
-     * So a device that is tagged for deletion or renamed in the source inventory
-     * keeps its old title on every graph until this runs.
+     * Nothing recomputes those columns when host.description changes — the only
+     * refresh path in core is api_device_save(), which this sync calls only when
+     * adding a device. So a device that is tagged for deletion or renamed in the
+     * source inventory keeps its old title on every graph until this runs.
      *
-     * Note that update_graph_title_cache() declines to overwrite a non-empty cache
-     * when the substituted title still contains an unresolved |host_ or |query_
-     * variable, so a graph whose data query index has disappeared stays stale.
+     * update_graph_title_cache() declines to overwrite a non-empty cache when the
+     * substituted title still contains an unresolved |host_ or |query_ variable,
+     * so a graph whose data query index has disappeared stays stale.
      */
     private function refreshTitleCaches(int $deviceId): void {
         global $config;
@@ -1360,13 +1635,18 @@ class CereusDatasyncEngine {
 
         $placed = 0;
         foreach ($this->treeRules as $rule) {
+            $treeId = (int)$rule['tree_id'];
+            if (!$treeId) continue;
+
+            // leaf_type 2 ("place matching graphs") is the automation rule's job —
+            // Cacti places those as each graph is created. Only a Host rule asks
+            // the plugin to put the device itself in the tree.
+            if ((int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
+
             if (!$this->matchTreeRule($rule, $device)) continue;
 
-            $treeId     = (int)$rule['tree_id'];
-            $parentItem = (int)$rule['tree_item_id'];
+            $parentItem = $this->ruleBranchFor($rule, $device, true);
             $grouping   = (int)$rule['host_grouping'];
-
-            if (!$treeId) continue;
 
             // Skip if already in this tree under this parent
             if (api_tree_host_exists($treeId, $parentItem, $deviceId)) continue;
@@ -1411,21 +1691,25 @@ class CereusDatasyncEngine {
             require_once $config['base_path'] . '/lib/api_tree.php';
         }
 
-        // Parents a currently-matching rule wants the device to stay under.
+        // Parents a currently-matching rule wants the device to stay under. Only a
+        // matching rule may create its branch — resolving the path of a rule that
+        // does not apply here would materialise headers as a side-effect.
         $keepParents = [];
         foreach ($this->treeRules as $rule) {
             $treeId = (int)$rule['tree_id'];
-            if (!$treeId) continue;
+            if (!$treeId || (int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
             if ($this->matchTreeRule($rule, $device)) {
-                $keepParents[$treeId . ':' . (int)$rule['tree_item_id']] = true;
+                $keepParents[$treeId . ':' . $this->ruleBranchFor($rule, $device, true)] = true;
             }
         }
 
         // Remove the device from managed parents it should no longer be under.
         foreach ($this->treeRules as $rule) {
-            $treeId     = (int)$rule['tree_id'];
-            $parentItem = (int)$rule['tree_item_id'];
-            if (!$treeId) continue;
+            $treeId = (int)$rule['tree_id'];
+            if (!$treeId || (int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
+
+            $parentItem = $this->ruleBranchFor($rule, $device, false);
+            if ($parentItem < 0) continue;   // branch does not exist — nothing to remove
             if (isset($keepParents[$treeId . ':' . $parentItem])) continue;
 
             $existing = api_tree_host_exists($treeId, $parentItem, $deviceId);
@@ -1443,29 +1727,251 @@ class CereusDatasyncEngine {
         return $this->applyTreeRules($deviceId, $device);
     }
 
+    /**
+     * The branch a rule wants this device under: its configured path when it has
+     * one, otherwise the Region / Country / Site path that applyRuleTemplate()
+     * builds, so the plugin and the generated automation rule agree on where the
+     * device belongs. With $create the missing headers are made; without it the
+     * branch is only looked up and -1 comes back when it is not there.
+     */
+    private function ruleBranchFor(array $rule, array $device, bool $create): int {
+        $treeId = (int)$rule['tree_id'];
+        if (!$treeId) return $create ? 0 : -1;
+
+        $path = trim((string)($rule['branch_path'] ?? ''));
+
+        if ($path === '') {
+            $parts = [];
+            foreach ([$device['region'] ?? '', $device['country'] ?? '', $device['site'] ?? ''] as $part) {
+                $part = trim((string)$part);
+                if ($part !== '') {
+                    $parts[] = str_replace('/', '\\/', $part);
+                }
+            }
+            $path = implode('/', $parts);
+        }
+
+        return $create
+            ? $this->resolveRuleBranch($treeId, $path, $this->branchSubs($device))
+            : $this->lookupRuleBranch($treeId, $path, $this->branchSubs($device));
+    }
+
+    private function treeRuleConditions(int $ruleId): array {
+        if (!isset($this->treeRuleConds[$ruleId])) {
+            $rows = db_fetch_assoc_prepared(
+                'SELECT * FROM plugin_cds_rule_conditions WHERE rule_id = ? ORDER BY sequence, id',
+                [$ruleId]
+            );
+            $this->treeRuleConds[$ruleId] = cacti_sizeof($rows) ? $rows : [];
+        }
+
+        return $this->treeRuleConds[$ruleId];
+    }
+
+    /**
+     * Evaluate a tree rule's conditions against one inventory row.
+     *
+     * The conditions are the same rows autoGraphRulesForAllLocations() materialises
+     * into a Cacti automation rule, so they are written in SQL terms (h.location,
+     * h.site_id, …) and joined with AND/OR connectors and parentheses. Evaluating
+     * them here follows SQL precedence — AND binds tighter than OR — so both
+     * engines read the same grouping the same way.
+     *
+     * Returns false for a rule with no conditions, with unbalanced parentheses, or
+     * naming a field that does not exist until the device is in the database:
+     * guessing either way would place devices the operator never asked for.
+     */
     private function matchTreeRule(array $rule, array $device): bool {
-        switch ($rule['match_field']) {
-            case 'description':  $haystack = $device['hostname'];          break;
-            case 'hostname':     $haystack = $device['ip'];                break;
-            case 'dev_function': $haystack = $device['dev_function'];      break;
-            case 'site':         $haystack = $device['site'] ?? '';        break;
-            case 'region':       $haystack = $device['region'] ?? '';      break;
-            case 'country':      $haystack = $device['country'] ?? '';     break;
-            default:             $haystack = $device['hostname'];          break;
+        $conditions = $this->treeRuleConditions((int)$rule['id']);
+        if (empty($conditions)) return false;
+
+        $precedence = ['OR' => 1, 'AND' => 2];
+        $values     = [];
+        $ops        = [];
+
+        // Fold the top operator over the two most recent operands.
+        $apply = function(string $op) use (&$values): bool {
+            if (count($values) < 2) return false;
+            $b = array_pop($values);
+            $a = array_pop($values);
+            $values[] = ($op === 'OR') ? ($a || $b) : ($a && $b);
+
+            return true;
+        };
+
+        $first = true;
+        foreach ($conditions as $cond) {
+            $result = $this->matchTreeCondition($cond, $device);
+
+            if ($result === null) {
+                if (!isset($this->treeRuleWarned[(int)$rule['id']])) {
+                    $this->treeRuleWarned[(int)$rule['id']] = true;
+                    $this->logDetail('tree_skip', '', '', null,
+                        'Rule "' . $rule['name'] . '": condition on "' . $cond['field']
+                        . '" cannot be evaluated before the device exists — leaving placement to the automation rule');
+                }
+
+                return false;
+            }
+
+            if (!$first) {
+                $op = (strtoupper((string)($cond['connector'] ?? 'AND')) === 'OR') ? 'OR' : 'AND';
+                while (!empty($ops) && end($ops) !== '(' && $precedence[end($ops)] >= $precedence[$op]) {
+                    if (!$apply((string)array_pop($ops))) return false;
+                }
+                $ops[] = $op;
+            }
+
+            for ($i = 0, $n = max(0, (int)($cond['open_paren'] ?? 0)); $i < $n; $i++) {
+                $ops[] = '(';
+            }
+
+            $values[] = $result;
+
+            for ($i = 0, $n = max(0, (int)($cond['close_paren'] ?? 0)); $i < $n; $i++) {
+                while (!empty($ops) && end($ops) !== '(') {
+                    if (!$apply((string)array_pop($ops))) return false;
+                }
+                if (empty($ops)) return false;   // unbalanced ")"
+                array_pop($ops);                 // discard the matching "("
+            }
+
+            $first = false;
         }
 
-        $pattern = $rule['pattern'];
-
-        switch ($rule['operator']) {
-            case 'contains':     return stripos($haystack, $pattern) !== false;
-            case 'not_contains': return stripos($haystack, $pattern) === false;
-            case 'equals':       return strcasecmp($haystack, $pattern) === 0;
-            case 'not_equals':   return strcasecmp($haystack, $pattern) !== 0;
-            case 'starts_with':  return stripos($haystack, $pattern) === 0;
-            case 'ends_with':    return stripos($haystack, $pattern) === strlen($haystack) - strlen($pattern);
-            case 'regex':        return (bool)@preg_match($pattern, $haystack);
-            default:             return false;
+        while (!empty($ops)) {
+            $op = (string)array_pop($ops);
+            if ($op === '(') return false;       // unbalanced "("
+            if (!$apply($op)) return false;
         }
+
+        return (count($values) === 1) ? (bool)$values[0] : false;
+    }
+
+    /**
+     * Evaluate one condition. Returns null when the condition cannot be decided
+     * from the inventory row, which the caller treats as "do not place".
+     */
+    private function matchTreeCondition(array $cond, array $device): ?bool {
+        $haystack = $this->treeRuleFieldValue((string)$cond['field'], $device);
+        if ($haystack === null) return null;
+
+        $subs    = $this->branchSubs($device) + ['{site_id}' => (string)$this->deviceSiteId($device)];
+        $pattern = str_replace(array_keys($subs), array_values($subs), (string)$cond['pattern']);
+
+        // Operator ids match the Cacti automation operators the UI offers.
+        switch ((int)$cond['operator']) {
+            case 1:  return stripos($haystack, $pattern) !== false;            // contains
+            case 2:  return stripos($haystack, $pattern) === false;            // does not contain
+            case 3:  return stripos($haystack, $pattern) === 0;                // begins with
+            case 5:  return $pattern === ''                                    // ends with
+                         || strcasecmp(substr($haystack, -strlen($pattern)), $pattern) === 0;
+            case 7:  return strcasecmp($haystack, $pattern) === 0;             // equals
+            default: return null;
+        }
+    }
+
+    /**
+     * Map a condition's field name onto the inventory row. Returns null for a
+     * field that only exists once the device (or its graphs) are in the database
+     * — h.notes, ht.name, gt.name and gtg.title_cache are all resolved by the
+     * generated automation rule instead, which runs against real tables.
+     */
+    private function treeRuleFieldValue(string $field, array $device): ?string {
+        switch ($field) {
+            // Fields the UI offers, in Cacti's SQL vocabulary.
+            case 'h.description': return trim((string)($device['hostname'] ?? ''));
+            case 'h.hostname':    return trim((string)($device['ip'] ?? ''));
+            case 'h.location':    return substr(trim((string)($device['site'] ?? '')), 0, 40);
+            case 'h.site_id':     return (string)$this->deviceSiteId($device);
+
+            // Legacy field names from the single-condition rule format.
+            case 'description':   return trim((string)($device['hostname'] ?? ''));
+            case 'hostname':      return trim((string)($device['ip'] ?? ''));
+            case 'dev_function':  return trim((string)($device['dev_function'] ?? ''));
+            case 'site':          return trim((string)($device['site'] ?? ''));
+            case 'region':        return trim((string)($device['region'] ?? ''));
+            case 'country':       return trim((string)($device['country'] ?? ''));
+
+            default:              return null;
+        }
+    }
+
+    // Site id for an inventory row, without creating anything. 0 when the
+    // location has no site yet.
+    private function deviceSiteId(array $device): int {
+        return $this->siteIdFor($device['region'] ?? '', $device['country'] ?? '', $device['site'] ?? '');
+    }
+
+    /**
+     * Site id for a location, 0 when none exists. The name format matches what
+     * DeviceManager::getOrCreateSiteId() stores: "region/country/site".
+     *
+     * A site an earlier sync flagged as empty carries the deletion tag in front
+     * of its name until reconciliation strips it again, so it is looked up in
+     * that form too — otherwise every run would create a fresh site for the
+     * location, only for the end-of-run pass to flag that one as well. The
+     * lookup is done here rather than left to DeviceManager, whose copy lives
+     * in Cacti's cli/ tree and is not updated when the plugin is deployed.
+     */
+    private function siteIdFor($region, $country, $site): int {
+        $parts = [];
+        foreach ([$region, $country, $site] as $part) {
+            $part = trim((string)$part);
+            if ($part !== '') {
+                $parts[] = $part;
+            }
+        }
+        if (empty($parts)) return 0;
+
+        $name = substr(implode('/', $parts), 0, 100);
+        if (!empty($this->siteIdCache[$name])) {
+            return $this->siteIdCache[$name];
+        }
+
+        $id = (int)db_fetch_cell_prepared('SELECT id FROM sites WHERE name = ? ORDER BY id LIMIT 1', [$name]);
+
+        if (!$id) {
+            // The profile's tag, plus the default one in case the profile's tag
+            // was changed after sites had already been flagged.
+            $tags = array_unique(array_filter([
+                trim((string)($this->profile['deletion_tag'] ?? '')),
+                '[TO BE DELETED]',
+            ]));
+
+            foreach ($tags as $tag) {
+                // Flagged names are cut to the 100-char column, so compare against
+                // the tagged form after the same cut.
+                $want = strtolower(trim($this->stripTag(substr($tag . ' ' . $name, 0, 100), $tag)));
+
+                $rows = db_fetch_assoc_prepared(
+                    'SELECT id, name FROM sites WHERE name LIKE ? ORDER BY id',
+                    [$this->likeEscape($tag) . '%']
+                );
+
+                foreach ($rows as $row) {
+                    if (strtolower(trim($this->stripTag((string)$row['name'], $tag))) === $want) {
+                        $id = (int)$row['id'];
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        if ($id) {
+            $this->siteIdCache[$name] = $id;
+        }
+
+        return $id;
+    }
+
+    // Site id for a location, creating the site only when none exists — neither
+    // under its plain name nor flagged with the deletion tag.
+    private function getOrCreateSite($devMgr, $region, $country, $site): int {
+        $id = $this->siteIdFor($region, $country, $site);
+        if ($id) return $id;
+
+        return (int)$devMgr->getOrCreateSiteId($region, $country, $site);
     }
 
     // ─── Empty-container marking ────────────────────────────────────────────────
@@ -2012,22 +2518,27 @@ class CereusDatasyncEngine {
     private function requireCliClasses(): void {
         global $config;
 
-        $cliDir = $config['base_path'] . '/cli';
+        // PhpSpreadsheet ships with the plugin (composer.json at the plugin root).
+        $autoload = dirname(__DIR__) . '/vendor/autoload.php';
 
-        if (!file_exists($cliDir . '/vendor/autoload.php')) {
-            throw new \RuntimeException('PhpSpreadsheet vendor autoload not found. Install it in ' . $cliDir . '/vendor/');
+        if (!file_exists($autoload)) {
+            throw new \RuntimeException('PhpSpreadsheet vendor autoload not found. Run "composer install" in '
+                . dirname(__DIR__) . '/');
         }
 
-        require_once $cliDir . '/vendor/autoload.php';
-        require_once $cliDir . '/lib/sync/Constants.php';
-        require_once $cliDir . '/lib/sync/Exceptions.php';
-        require_once $cliDir . '/lib/sync/Logger.php';
-        require_once $cliDir . '/lib/sync/Validator.php';
-        require_once $cliDir . '/lib/sync/DeviceMatcher.php';
-        require_once $cliDir . '/lib/sync/DatabaseTransaction.php';
-        require_once $cliDir . '/lib/sync/ExcelLoader.php';
-        require_once $cliDir . '/lib/sync/DeviceManager.php';
-        require_once $cliDir . '/lib/sync/ParallelSNMPChecker.php';
+        require_once $autoload;
+
+        // The sync classes ship with the plugin so they are deployed with it.
+        $syncDir = __DIR__ . '/sync';
+        require_once $syncDir . '/Constants.php';
+        require_once $syncDir . '/Exceptions.php';
+        require_once $syncDir . '/Logger.php';
+        require_once $syncDir . '/Validator.php';
+        require_once $syncDir . '/DeviceMatcher.php';
+        require_once $syncDir . '/DatabaseTransaction.php';
+        require_once $syncDir . '/ExcelLoader.php';
+        require_once $syncDir . '/DeviceManager.php';
+        require_once $syncDir . '/ParallelSNMPChecker.php';
 
         if (!function_exists('api_device_save')) {
             require_once $config['base_path'] . '/lib/api_device.php';

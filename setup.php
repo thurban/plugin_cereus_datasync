@@ -63,9 +63,8 @@ function plugin_cereus_datasync_upgrade() {
  *
  * Selection is by evidence rather than by tag: any device whose graph title is built
  * from |host_description| but whose cached title no longer contains the device's
- * current description. That covers tagged and renamed devices alike, and skips
- * installs with nothing to fix. LOCATE() is used instead of LIKE so that a
- * description containing % or _ is matched literally.
+ * current description. LOCATE() is used instead of LIKE so that a description
+ * containing % or _ is matched literally.
  */
 function cereus_datasync_backfill_title_caches() {
     global $config;
@@ -178,6 +177,8 @@ function cereus_datasync_poller_bottom() {
 // ─── Table creation ──────────────────────────────────────────────────────────
 
 function cereus_datasync_setup_tables() {
+    global $config;
+
     $charset = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC";
 
     db_execute("CREATE TABLE IF NOT EXISTS plugin_cds_profiles (
@@ -249,9 +250,10 @@ function cereus_datasync_setup_tables() {
         enabled      CHAR(2)      NOT NULL DEFAULT 'on',
         name         VARCHAR(128) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         tree_id      INT UNSIGNED NOT NULL DEFAULT 0,
+        branch_path  VARCHAR(512) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         leaf_type    TINYINT UNSIGNED NOT NULL DEFAULT 2,
         host_grouping TINYINT UNSIGNED NOT NULL DEFAULT 1,
-        branch_path  VARCHAR(255) NOT NULL DEFAULT '{region}/{country}/{site}' COLLATE utf8mb4_unicode_ci,
+        require_group VARCHAR(64) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         PRIMARY KEY (id),
         INDEX idx_profile_order (profile_id, rule_order)
     ) $charset");
@@ -322,6 +324,7 @@ function cereus_datasync_setup_tables() {
         aggregate_template_id INT UNSIGNED      NOT NULL DEFAULT 0,
         tree_id               INT UNSIGNED      NOT NULL DEFAULT 0,
         tree_item_id          INT UNSIGNED      NOT NULL DEFAULT 0,
+        branch_path           VARCHAR(512)      NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         device_match_field    VARCHAR(64)       NOT NULL DEFAULT '',
         device_match_pattern  VARCHAR(256)      NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         result_graph_id       INT UNSIGNED      NOT NULL DEFAULT 0,
@@ -357,16 +360,6 @@ function cereus_datasync_setup_tables() {
         db_execute("UPDATE plugin_cds_rule_conditions SET connector = 'AND' WHERE operation <> 2");
     }
 
-    // Migration: tree-rule templates — operator-defined branch path. The generated
-    // branch was fixed at Region/Country/Site; branch_path lets each template pick
-    // its own levels (or a literal collector branch). The default reproduces the
-    // former hierarchy so existing templates keep their rules and their names.
-    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_tree_rules LIKE 'branch_path'"))) {
-        db_execute("ALTER TABLE plugin_cds_tree_rules
-            ADD COLUMN branch_path VARCHAR(255) NOT NULL DEFAULT '{region}/{country}/{site}'
-            COLLATE utf8mb4_unicode_ci AFTER host_grouping");
-    }
-
     // Migration: add graph_title_pattern to aggregate rules table
     if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_aggregate_rules LIKE 'graph_title_pattern'"))) {
         db_execute("ALTER TABLE plugin_cds_aggregate_rules
@@ -390,6 +383,54 @@ function cereus_datasync_setup_tables() {
     if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_aggregate_rules LIKE 'site_name'"))) {
         db_execute("ALTER TABLE plugin_cds_aggregate_rules
             ADD COLUMN site_name VARCHAR(128) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER placement_mode");
+    }
+
+    // Migration: branch_path — a rule now names its target branch as a "/"-separated
+    // path ("EMEA/Germany/Munich") and any header missing from that path is created
+    // at sync time, replacing the dropdown that could only pick an existing node.
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_tree_rules LIKE 'branch_path'"))) {
+        db_execute("ALTER TABLE plugin_cds_tree_rules
+            ADD COLUMN branch_path VARCHAR(512) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER tree_id");
+    }
+
+    // Installs upgraded through 1.5.0/1.5.1 got branch_path as VARCHAR(255) with
+    // '{region}/{country}/{site}' as the default. Widen it to match; stored paths
+    // are kept, and that default resolves to the same branch as an empty path.
+    $branchCol = db_fetch_row("SHOW COLUMNS FROM plugin_cds_tree_rules LIKE 'branch_path'");
+    if (cacti_sizeof($branchCol) && stripos($branchCol['Type'], 'varchar(512)') === false) {
+        db_execute("ALTER TABLE plugin_cds_tree_rules
+            MODIFY COLUMN branch_path VARCHAR(512) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci");
+    }
+
+    // Migration: require_group — templates sharing a group name are placed at a
+    // location only when every one of them matches at least one graph there.
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_tree_rules LIKE 'require_group'"))) {
+        db_execute("ALTER TABLE plugin_cds_tree_rules
+            ADD COLUMN require_group VARCHAR(64) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER host_grouping");
+    }
+
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_aggregate_rules LIKE 'branch_path'"))) {
+        db_execute("ALTER TABLE plugin_cds_aggregate_rules
+            ADD COLUMN branch_path VARCHAR(512) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER tree_item_id");
+
+        // Carry each existing rule's chosen node over as its path so placement does
+        // not move when the dropdown is replaced by the text field.
+        require_once $config['base_path'] . '/plugins/cereus_datasync/lib/functions.php';
+
+        $agg_rules = db_fetch_assoc("SELECT id, tree_id, tree_item_id
+            FROM plugin_cds_aggregate_rules WHERE tree_item_id > 0");
+
+        if (cacti_sizeof($agg_rules)) {
+            foreach ($agg_rules as $agg_rule) {
+                db_execute_prepared(
+                    'UPDATE plugin_cds_aggregate_rules SET branch_path = ? WHERE id = ?',
+                    [
+                        cereus_datasync_branch_path_for_item((int)$agg_rule['tree_id'], (int)$agg_rule['tree_item_id']),
+                        (int)$agg_rule['id'],
+                    ]
+                );
+            }
+        }
     }
 
     // Migration: add condition_logic to aggregate rules table (AND/OR between two device conditions)

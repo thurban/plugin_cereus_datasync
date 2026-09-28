@@ -107,12 +107,14 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
         . '&bull; <code>{site}</code> — Site name from Excel (truncated to 40 chars to match <strong>h.location</strong>).<br>'
         . '&bull; <code>{region}</code> — Region from Excel.<br>'
         . '&bull; <code>{country}</code> — Country from Excel.<br><br>'
-        . '<strong>Branch path:</strong> the tree branch the generated rule points at, written as <code>/</code>-separated levels. Each level is either literal text or a placeholder, so you choose the depth yourself — '
-        . '<code>{region}/{country}/{site}</code>, <code>{region}/{country}</code>, <code>{site}</code>, or a fixed collector branch such as <code>Internet</code> or <code>Internet/{region}</code>. '
-        . 'A level whose placeholder is empty for a device is skipped, and locations that land on the same branch with the same conditions share one rule instead of generating duplicates.<br><br>'
+        . '<strong>Branch path:</strong> leave it blank to keep the existing behaviour, where the branch is built from Region / Country / Site. '
+        . 'Otherwise give a <code>/</code>-separated path such as <code>{region}/{country}/{site}</code> or <code>EMEA/Germany/Munich</code> &mdash; the same placeholders apply, '
+        . 'and every header in the path that does not exist yet is created during the run. Write <code>\\/</code> for a literal slash inside one header name.<br><br>'
         . '<strong>Grouping:</strong> each condition joins to the previous one with <strong>AND</strong> or <strong>OR</strong>, and the <strong>(</strong> / <strong>)</strong> columns add parentheses so you can build grouped logic — e.g. '
         . '<code>h.site_id&nbsp;equals&nbsp;{site_id} AND ( h.location&nbsp;begins&nbsp;Stuttgart OR h.location&nbsp;begins&nbsp;München OR h.location&nbsp;begins&nbsp;Lübeck )</code>. '
-        . 'Balance every <strong>(</strong> with a matching <strong>)</strong>.',
+        . 'Balance every <strong>(</strong> with a matching <strong>)</strong>.<br><br>'
+        . '<strong>Co-requisite group:</strong> give two or more templates the same group name (e.g. <code>anyconnect-internet</code>) and they are placed at a location only when <em>every</em> template in the group matches at least one graph there. '
+        . 'If one of them has no match, no Cacti tree rule, no branch and no graph placement is created for that location. Rules and placements from an earlier run are removed again once the group stops matching.',
         'cereus_datasync');
     print '</td></tr>';
     print '<tr class="even"><td style="padding:6px 15px;">';
@@ -136,6 +138,11 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
                 print '<option value="' . $tid . '"' . ($tid == $tpl['tree_id'] ? ' selected' : '') . '>' . html_escape($tname) . '</option>';
             }
             print '</select>';
+            print '<input type="text" class="cds-tpl-branch ui-state-default ui-corner-all" data-id="' . $tplId . '"'
+                . ' value="' . html_escape($tpl['branch_path'] ?? '') . '"'
+                . ' placeholder="' . __('Branch path, e.g. {region}/{country}/{site}', 'cereus_datasync') . '"'
+                . ' title="' . __('Leave blank to build the branch from Region / Country / Site in the inventory file. Any header in the path that does not exist is created on the next sync run.', 'cereus_datasync') . '"'
+                . ' style="min-width:240px;flex:1;">';
             print '<select class="cds-tpl-leaf ui-state-default ui-corner-all" data-id="' . $tplId . '">';
             foreach ($leafTypes as $lv => $ll) {
                 print '<option value="' . $lv . '"' . ($lv == $tpl['leaf_type'] ? ' selected' : '') . '>' . html_escape($ll) . '</option>';
@@ -146,13 +153,13 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
                 print '<option value="' . $gv . '"' . ($gv == $tpl['host_grouping'] ? ' selected' : '') . '>' . html_escape($gl) . '</option>';
             }
             print '</select>';
+            print '<input type="text" class="cds-tpl-reqgrp ui-state-default ui-corner-all" data-id="' . $tplId . '"'
+                . ' value="' . html_escape($tpl['require_group'] ?? '') . '" maxlength="64"'
+                . ' placeholder="' . __('Co-requisite group', 'cereus_datasync') . '"'
+                . ' title="' . __('Optional. Templates with the same group name are placed at a location only when every one of them matches at least one graph there; otherwise no tree rule, no branch and no graph placement is created for that location.', 'cereus_datasync') . '"'
+                . ' style="width:150px;">';
             print '<label style="font-size:12px;"><input type="checkbox" class="cds-tpl-enabled" data-id="' . $tplId . '"' . ($tpl['enabled'] === 'on' ? ' checked' : '') . '> ' . __('Enabled', 'cereus_datasync') . '</label>';
             print '<button type="button" class="ui-button cds-tpl-del" data-id="' . $tplId . '" style="margin-left:auto;min-width:0;padding:2px 10px;color:#dc2626;border-color:#fca5a5;">&#128465; Delete</button>';
-            print '</div>';
-            print '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">';
-            print '<span style="font-size:12px;color:#475569;white-space:nowrap;">' . __('Branch path', 'cereus_datasync') . '</span>';
-            print '<input type="text" class="cds-tpl-path ui-state-default ui-corner-all" data-id="' . $tplId . '" value="' . html_escape($tpl['branch_path']) . '" placeholder="{region}/{country}/{site}" style="flex:1;font-family:monospace;">';
-            print '<span style="font-size:11px;color:#64748b;white-space:nowrap;">' . __('literal text and %s allowed', '<code>{region} {country} {site}</code>', 'cereus_datasync') . '</span>';
             print '</div>';
             print '</td></tr>';
 
@@ -274,7 +281,7 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
     }
 
     $(function() {
-        $(document).on('blur change', '.cds-tpl-name, .cds-tpl-tree, .cds-tpl-leaf, .cds-tpl-grp, .cds-tpl-path, .cds-tpl-enabled', function() {
+        $(document).on('blur change', '.cds-tpl-name, .cds-tpl-tree, .cds-tpl-branch, .cds-tpl-leaf, .cds-tpl-grp, .cds-tpl-reqgrp, .cds-tpl-enabled', function() {
             saveTpl($(this).data('id'));
         });
 
@@ -286,9 +293,10 @@ function cereus_datasync_rule_templates_page(int $profileId, array $profile): vo
                 profile_id:    cdsProfileId,
                 name:          $('.cds-tpl-name[data-id="' + tid + '"]').val(),
                 tree_id:       $('.cds-tpl-tree[data-id="' + tid + '"]').val(),
+                branch_path:   $('.cds-tpl-branch[data-id="' + tid + '"]').val(),
                 leaf_type:     $('.cds-tpl-leaf[data-id="' + tid + '"]').val(),
                 host_grouping: $('.cds-tpl-grp[data-id="' + tid + '"]').val(),
-                branch_path:   $('.cds-tpl-path[data-id="' + tid + '"]').val(),
+                require_group: $('.cds-tpl-reqgrp[data-id="' + tid + '"]').val(),
                 enabled:       $('.cds-tpl-enabled[data-id="' + tid + '"]').is(':checked') ? 'on' : '',
                 __csrf_magic:  csrfMagicToken
             }, function() { cdsShowSaved(); }, 'json');
@@ -472,9 +480,7 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
     var cdsATpls      = <?php print $aTplsJson; ?>;
     var cdsAggFields  = <?php print $condFldJson; ?>;
     var cdsAggOpers   = <?php print $operJson; ?>;
-    var cdsRootLbl    = <?php print json_encode(__('(Tree Root)', 'cereus_datasync')); ?>;
     var cdsSaveTimer  = null;
-    var cdsNodeXHR    = {}; // tracks in-flight loadNodes requests per rule id
 
     function cdsShowSaved() {
         $('#cds-saving-toast').hide();
@@ -505,7 +511,7 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
             graph_template_id:     $('#cds-agg-gtpl-'    + rid).val(),
             aggregate_template_id: $('#cds-agg-atpl-'    + rid).val(),
             tree_id:               $('#cds-agg-tree-'    + rid).val(),
-            tree_item_id:          $('#cds-agg-node-'    + rid).val(),
+            branch_path:           $('#cds-agg-branch-'  + rid).val(),
             placement_mode:        $('#cds-agg-pmode-'   + rid).val(),
             site_name:             $('#cds-agg-site-'    + rid).val(),
             graph_title_pattern:   $('#cds-agg-tpat-'    + rid).val(),
@@ -514,60 +520,11 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
         }, function() { cdsShowSaved(); }, 'json');
     }
 
-    // Abort any in-flight request for this rule before starting a new one so
-    // rapid tree switching never leaves stale nodes from a slower earlier request.
-    // Cacti's themeReady() wraps every <select> with jQuery UI selectmenu(), so
-    // after it runs we must go through the widget API — .prop('disabled') and
-    // .html() on the underlying <select> are invisible to the widget.
-    function selHasWidget(sel) {
-        return !!sel.data('ui-selectmenu');
-    }
-    function selDisable(sel) {
-        selHasWidget(sel) ? sel.selectmenu('disable') : sel.prop('disabled', true);
-    }
-    function selEnable(sel) {
-        selHasWidget(sel) ? sel.selectmenu('enable') : sel.prop('disabled', false);
-    }
-    function selSetOptions(sel, html, selectedVal) {
-        sel.html(html);
-        if (selHasWidget(sel)) {
-            // val() + refresh pushes the new option list into the widget DOM
-            sel.val(selectedVal).selectmenu('refresh');
-        } else {
-            sel.val(selectedVal);
-        }
-    }
-
-    function loadNodes(rid, treeId, selectedNodeId) {
-        if (cdsNodeXHR[rid]) { cdsNodeXHR[rid].abort(); }
-        var sel = $('#cds-agg-node-' + rid);
-        selDisable(sel);
-        cdsNodeXHR[rid] = $.ajax({
-            url:      'cereus_datasync_ajax.php',
-            type:     'GET',
-            cache:    false,
-            data:     { action: 'get_tree_nodes', tree_id: treeId },
-            dataType: 'json',
-            success: function(data) {
-                delete cdsNodeXHR[rid];
-                var html = buildSel(data.nodes || {'0': cdsRootLbl}, selectedNodeId || 0);
-                selSetOptions(sel, html, selectedNodeId || 0);
-                selEnable(sel);
-            },
-            error: function(xhr, status) {
-                if (status !== 'abort') selEnable(sel);
-            }
-        });
-    }
-
     // Bind the tree dropdown for one rule directly by ID (namespaced event).
     // Direct binding avoids stacking issues when the script re-runs on AJAX
     // tab re-navigation; .off('change.aggTree') removes the prior handler first.
     function bindAggTree(rid) {
         $('#cds-agg-tree-' + rid).off('change.aggTree').on('change.aggTree', function() {
-            if ($('#cds-agg-pmode-' + rid).val() !== '1') {
-                loadNodes(rid, this.value, 0);
-            }
             saveAggRule(rid);
         });
     }
@@ -643,7 +600,6 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
             var isSite = $(this).val() === '1';
             $('#cds-agg-node-wrap-' + rid).toggle(!isSite);
             $('#cds-agg-site-wrap-' + rid).toggle(isSite);
-            if (!isSite) loadNodes(rid, $('#cds-agg-tree-' + rid).val(), 0);
             saveAggRule(rid);
         });
 
@@ -714,13 +670,10 @@ function cereus_datasync_agrules_tab(int $profileId, array $profile): void {
             }, 'json');
         });
 
-        // Bind tree dropdowns and load nodes for fixed-mode rules
+        // Bind the tree dropdown for each rule
         <?php if (cacti_sizeof($rules)): foreach ($rules as $rule): ?>
         bindAggTree(<?php print (int)$rule['id']; ?>);
         cdsRefreshAggConnectors(<?php print (int)$rule['id']; ?>);
-        <?php if ((int)($rule['placement_mode'] ?? 0) === 0): ?>
-        loadNodes(<?php print (int)$rule['id']; ?>, <?php print (int)$rule['tree_id']; ?>, <?php print (int)$rule['tree_item_id']; ?>);
-        <?php endif; ?>
         <?php endforeach; endif; ?>
     });
     </script>
@@ -760,11 +713,13 @@ function cereus_datasync_render_agg_rule_card(array $rule, array $trees, array $
     }
     print '</select>';
 
-    // Tree node (fixed mode only)
+    // Branch path (fixed mode only) — blank means the tree root
     print '<span id="cds-agg-node-wrap-' . $rid . '" style="' . $nodeVis . '">';
-    print '<select id="cds-agg-node-' . $rid . '" class="cds-agg-field ui-state-default ui-corner-all" data-id="' . $rid . '">';
-    print '<option value="0">' . __('(Tree Root)', 'cereus_datasync') . '</option>';
-    print '</select>';
+    print '<input type="text" id="cds-agg-branch-' . $rid . '" class="cds-agg-field ui-state-default ui-corner-all"'
+        . ' data-id="' . $rid . '" value="' . html_escape($rule['branch_path'] ?? '') . '"'
+        . ' placeholder="' . __('Branch path, e.g. EMEA/Germany/Munich', 'cereus_datasync') . '"'
+        . ' title="' . __('Leave blank for the tree root. Any header in the path that does not exist is created on the next sync run.', 'cereus_datasync') . '"'
+        . ' style="min-width:220px;">';
     print '</span>';
 
     // Site name (site mode only)

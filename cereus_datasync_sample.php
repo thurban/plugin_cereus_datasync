@@ -15,16 +15,13 @@ if (!cereus_datasync_license_ok()) {
     exit;
 }
 
-global $config;
-$cliDir = $config['base_path'] . '/cli';
-
-if (!file_exists($cliDir . '/vendor/autoload.php')) {
+if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
     http_response_code(500);
     print 'PhpSpreadsheet not available';
     exit;
 }
 
-require_once $cliDir . '/vendor/autoload.php';
+require_once __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;

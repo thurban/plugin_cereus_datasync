@@ -5,6 +5,100 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-09-28
+
+### Added
+- **Branch paths for aggregate graph rules.** Aggregate rules name their target
+  branch as a `/`-separated path such as `EMEA/Germany/Munich`, like rule
+  templates do since 1.5.0, instead of picking from a dropdown of nodes that
+  already exist. Every header missing from a path — on aggregate rules and rule
+  templates alike — is created during the run, so a rule can be written before
+  its branch exists. Write `\/` for a literal slash inside a single header name.
+- **Co-requisite rule templates.** Graph rule templates that share a
+  *Co-requisite group* name are placed as a unit: at a given location their
+  Cacti tree rules, branch and graph placements are created only when every
+  template in the group matches at least one graph there (e.g. an Internet graph
+  only where an AnyConnect graph also exists). The check runs after the sync has
+  created its graphs; rules and placements from an earlier run are deleted once
+  a group stops matching.
+
+### Changed
+- Rule template branch paths are stored as up to 512 characters; installs on the
+  1.5.x schema are widened on upgrade with their paths kept. A blank path builds
+  Region / Country / Site, the same as `{region}/{country}/{site}`, and a `/`
+  inside a placeholder's value stays part of that one header.
+- Aggregate rules store the target branch as `branch_path` rather than a
+  `tree_item_id`; existing rules are migrated by writing their current node's
+  full path into the new field, so placement does not move.
+- The sync classes (`DeviceManager`, `ExcelLoader`, …) moved from Cacti's
+  `cli/lib/sync/` into the plugin as `lib/sync/`, so they are deployed with it.
+  They were left over from the standalone script the plugin grew out of.
+  PhpSpreadsheet now ships with the plugin as well (`vendor/`, with
+  `composer.json` / `composer.lock`) instead of being loaded from `cli/vendor/`.
+- PhpSpreadsheet upgraded from 1.16.0 to 1.30.7. Composer refuses to install
+  1.16.0 because of 28 published security advisories, and the old dependency set
+  required PHP 8.0. The bundled set is resolved for PHP 7.4 and later.
+
+### Fixed
+- **Long site names were cut to 40 characters in rule template branches.** The
+  limit exists only to match the truncated `h.location` column; branch titles now
+  use the full name.
+- **A sync that failed to start stayed "queued" forever.** Errors raised before
+  the engine recorded the run — a missing library, an incompatible PHP version —
+  only reached `cacti.log`. The runner now marks the run as failed and stores
+  the reason, so it shows on the run log page.
+- **Empty sites were re-created and re-flagged on every run.** A site flagged
+  with the deletion tag was not always recognised as the existing site for its
+  location, so a new one was created and flagged again at the end of the run.
+  Site lookup now happens in the plugin and matches flagged sites regardless of
+  whitespace and case, and under the default tag if the profile's tag changed.
+- **Aggregate rules in Site placement mode created a duplicate site header on
+  every run.** The lookup that should have found the existing header filtered on
+  `graph_tree_items.leaf_type`, a column Cacti 1.2 does not have, so the query
+  errored, the header was never found, and a new one was added each sync. Site
+  mode now resolves through the same branch-path code as fixed placement.
+- **Tree placement rules never matched anything.** `matchTreeRule()` read
+  `match_field`, `operator` and `pattern` off the rule row — columns that went
+  away when conditions moved to their own table — so it returned false for every
+  device and direct tree placement silently did nothing. It now evaluates the
+  rule's real conditions, with AND/OR connectors and parentheses read the same
+  way SQL reads them, so a rule groups identically whether the plugin evaluates
+  it or the generated Cacti automation rule does. A condition naming a field that
+  only exists once the device is in the database (`h.notes`, `ht.name`,
+  `gt.name`, `gtg.title_cache`) leaves placement to the automation rule rather
+  than guessing.
+- **Host placement ignored the rule's leaf type.** Direct placement put the
+  device in the tree regardless of whether the rule said *Graph* or *Host*. A
+  Graph rule's placement belongs to Cacti's automation hook, which runs as each
+  graph is created, so the plugin now only places the device itself for a Host
+  rule.
+- **A rule with no branch path placed devices at the tree root.** It now falls
+  back to the same Region / Country / Site path the rule template builds, so both
+  engines target the same branch.
+- **An unbalanced parenthesis in a rule template's conditions generated
+  automation rules that could never run.** The conditions were materialised into
+  Cacti's token stream verbatim, and `build_rule_item_filter()` concatenates
+  tokens without checking them, so a `(` with no matching `)` reached MySQL as a
+  syntax error — every device match failed and nothing was placed, with no error
+  surfaced anywhere. Rule templates whose parentheses do not balance, or whose
+  `)` precedes its `(`, are now skipped with an entry in the sync log instead of
+  overwriting a working automation rule with a broken one.
+- **`{site_id}` resolved to 0 for a location whose site was flagged empty.** The
+  lookup behind the placeholder matched only the plain site name, but a site an
+  earlier sync flagged as empty carries the deletion tag on its name until the
+  reconciliation pass strips it — and rule generation runs before the devices
+  that would revive it are added. The placeholder then became `0`, and with a
+  *contains* operator `h.site_id LIKE '%0%'` matches every site id containing a
+  zero, scattering that location's graphs across unrelated branches. The lookup
+  now falls back to the tagged name the way `getOrCreateSiteId()` does, and a
+  rule whose `{site_id}` still cannot be resolved is skipped rather than written
+  with a pattern of 0.
+- **Autosave could silently disable a rule by clearing its tree.** The tree
+  dropdowns open on `-- Select Tree --` (value 0) and every field on the rules
+  pages saves the whole row on blur, so a save firing before the dropdown was
+  re-selected overwrote a configured tree with 0 and left the rule inert. Tree
+  rules, aggregate rules and OID rules now read a posted 0 as "unchanged".
+
 ## [1.5.1] - 2026-08-10
 
 ### Fixed

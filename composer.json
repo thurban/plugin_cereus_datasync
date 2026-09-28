@@ -1,0 +1,15 @@
+{
+	"name": "urban-software/cereus_datasync",
+	"description": "Inventory synchronisation plugin for Cacti",
+	"license": "GPL-2.0-or-later",
+	"minimum-stability": "stable",
+	"require": {
+		"php": ">=7.4",
+		"phpoffice/phpspreadsheet": "^1.29"
+	},
+	"config": {
+		"platform": {
+			"php": "7.4.3"
+		}
+	}
+}

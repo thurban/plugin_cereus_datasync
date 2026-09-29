@@ -596,3 +596,15 @@ function cereus_datasync_help_link(string $section = ''): string {
     return '<a href="' . html_escape($url) . '" class="cds-link cds-help-link">'
         . '<i class="fa fa-question-circle" aria-hidden="true"></i> ' . __('Help', 'cereus_datasync') . '</a>';
 }
+
+// A run whose process died — server restart, killed, out of memory — never
+// records its end and would show as Queued or Running forever. Anything in
+// that state for 12 hours is closed as failed; real runs take minutes.
+function cereus_datasync_fail_stale_runs(): void {
+    db_execute("UPDATE plugin_cds_runs
+        SET status = 'failed', completed_at = COALESCE(completed_at, NOW()),
+            error_message = 'The sync process stopped without finishing (for example a server restart or a killed process).'
+        WHERE status IN ('queued', 'running')
+        AND started_at < NOW() - INTERVAL 12 HOUR");
+}
+

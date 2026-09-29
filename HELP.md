@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.7.0.
+one. This guide covers version 1.7.1.
 
 ---
 

@@ -21,6 +21,8 @@ $action     = get_nfilter_request_var('action', '');
 $profile_id = get_filter_request_var('profile_id', FILTER_VALIDATE_INT) ?: 0;
 $run_id     = get_filter_request_var('run_id', FILTER_VALIDATE_INT) ?: 0;
 
+cereus_datasync_fail_stale_runs();
+
 switch ($action) {
     case 'view':
         top_header();
@@ -145,8 +147,10 @@ function cereus_datasync_log_detail(int $runId): void {
     $sql_where  = 'WHERE run_id = ?';
     $sql_params = [$runId];
     if (!empty($actionFilter)) {
-        $sql_where  .= ' AND action = ?';
+        // A dry run logs "added_dry" etc.; the card for "added" lists those too.
+        $sql_where  .= ' AND action IN (?, ?)';
         $sql_params[] = $actionFilter;
+        $sql_params[] = $actionFilter . '_dry';
     }
 
     $total = (int)db_fetch_cell_prepared("SELECT COUNT(*) FROM plugin_cds_run_details $sql_where", $sql_params);
@@ -206,6 +210,20 @@ function cereus_datasync_log_detail(int $runId): void {
     }
     print '</div>';
 
+    if ($run['dry_run']) {
+        $unchecked = (int)db_fetch_cell_prepared(
+            "SELECT COUNT(*) FROM plugin_cds_run_details
+             WHERE run_id = ? AND action = 'added_dry' AND details LIKE 'dry-run — interface check not run%'",
+            [$runId]
+        );
+        print '<div style="padding:8px 14px;margin:-6px 0 16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#7c2d12;">';
+        print __('Dry run: nothing was changed. The counts show what a real run would do.', 'cereus_datasync');
+        if ($unchecked > 0) {
+            print ' ' . __('%d of the devices counted as added still need the SNMP interface check, which dry runs skip — a real run adds them only if an interface matches.', $unchecked, 'cereus_datasync');
+        }
+        print '</div>';
+    }
+
     // Three-column dashboard grid
     print '<div style="display:grid;grid-template-columns:220px 1fr 180px;gap:16px;align-items:start;">';
 
@@ -242,8 +260,8 @@ function cereus_datasync_log_detail(int $runId): void {
     foreach ($devCards as [$key, $val, $label, $color, $bg]) {
         $active = ($actionFilter === $key);
         $detailCount = (int)db_fetch_cell_prepared(
-            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action = ?",
-            [$runId, $key]
+            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action IN (?, ?)",
+            [$runId, $key, $key . '_dry']
         );
         $href = 'cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($active ? '' : $key);
         $cardBg    = $active ? $color : $bg;
@@ -274,8 +292,8 @@ function cereus_datasync_log_detail(int $runId): void {
     foreach ($graphCards as [$key, $val, $label, $color, $bg]) {
         $active = ($actionFilter === $key);
         $detailCount = (int)db_fetch_cell_prepared(
-            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action = ?",
-            [$runId, $key]
+            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action IN (?, ?)",
+            [$runId, $key, $key . '_dry']
         );
         $href = 'cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($active ? '' : $key);
         $cardBg    = $active ? $color : $bg;

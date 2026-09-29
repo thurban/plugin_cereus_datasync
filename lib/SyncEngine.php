@@ -255,9 +255,10 @@ class CereusDatasyncEngine {
                     }
                 }
             } elseif (!empty($l2check)) {
-                // Dry run — assume interfaces match (no SNMP in dry run)
+                // Dry run — no SNMP, so the interface check cannot run: count the
+                // device as an add, but say it still depends on that check.
                 foreach ($l2check as $dev) {
-                    $toAdd[] = ['device' => $dev, 'has_wan' => true];
+                    $toAdd[] = ['device' => $dev, 'has_wan' => true, 'unchecked' => true];
                 }
             }
 
@@ -322,7 +323,11 @@ class CereusDatasyncEngine {
 
                 if ($this->dryRun) {
                     $this->stats['added']++;
-                    $this->logDetail('added_dry', $device['hostname'], $device['ip'], null, 'dry-run');
+                    $this->logDetail('added_dry', $device['hostname'], $device['ip'], null,
+                        !empty($item['unchecked'])
+                            ? 'dry-run — interface check not run; a real run adds it only if an interface matches "'
+                              . ($this->profile['snmp_wan_pattern'] ?? '') . '"'
+                            : 'dry-run');
                     continue;
                 }
 
@@ -565,12 +570,20 @@ class CereusDatasyncEngine {
                 'total_items'           => [],
             ];
 
+            $wasNew = ($resultGraphId <= 0);
+
             try {
                 aggregate_create_update($resultGraphId, $memberGraphIds, $attribs);
             } catch (\Throwable $e) {
                 $this->logDetail('agg_error', '', '', null,
                     'Rule "' . $rule['name'] . '": ' . $e->getMessage());
                 continue;
+            }
+
+            if ($wasNew && $resultGraphId > 0) {
+                $this->stats['graphs_created']++;
+                $this->logDetail('graph_created', '', '', null,
+                    'graph_id=' . $resultGraphId . ' aggregate rule "' . $rule['name'] . '"');
             }
 
             // Persist updated result_graph_id (set by aggregate_create_update via reference)
@@ -606,6 +619,7 @@ class CereusDatasyncEngine {
                     $resultGraphId,
                     0, 0, 0, 1, false
                 );
+                $this->countTreePlacement($resultGraphId, '', '', null);
             }
 
             // Place each member graph at the same tree node
@@ -620,6 +634,7 @@ class CereusDatasyncEngine {
                         $memberId,
                         0, 0, 0, 1, false
                     );
+                    $this->countTreePlacement($memberId, '', '', null);
                 }
             }
 
@@ -777,6 +792,7 @@ class CereusDatasyncEngine {
                         );
                         if ($existingGraphId && !api_tree_graph_exists($treeId, $treeItemId, $existingGraphId)) {
                             api_tree_item_save(0, $treeId, TREE_ITEM_TYPE_GRAPH, $treeItemId, '', $existingGraphId, 0, 0, 0, 1, false);
+                            $this->countTreePlacement($existingGraphId, $host['description'], $host['hostname'], $hostId);
                         }
                     }
                     $skipped++;
@@ -810,10 +826,15 @@ class CereusDatasyncEngine {
                     push_out_host($hostId, $localDataId);
                 }
 
+                $this->stats['graphs_created']++;
+                $this->logDetail('graph_created', $host['description'], $host['hostname'], $hostId,
+                    'graph_id=' . $localGraphId . ' OID rule "' . $rule['name'] . '"');
+
                 // Place in tree if configured
                 if ($treeId && !api_tree_graph_exists($treeId, $treeItemId, $localGraphId)) {
                     api_tree_item_save(0, $treeId, TREE_ITEM_TYPE_GRAPH, $treeItemId, '', $localGraphId, 0, 0, 0, 1, false);
                 }
+                $this->countTreePlacement($localGraphId, $host['description'], $host['hostname'], $hostId);
 
                 $created++;
             }
@@ -1034,6 +1055,10 @@ class CereusDatasyncEngine {
                 }
                 $this->logDetail('graph_created', $device['hostname'], $device['ip'], $deviceId,
                     'graph_id=' . $result['local_graph_id'] . ' snmp_index=' . $snmpIndex);
+
+                // Cacti's tree automation places the graph while it is created;
+                // count it here, since nothing else sees that placement.
+                $this->countTreePlacement((int)$result['local_graph_id'], $device['hostname'], $device['ip'], $deviceId);
             }
         }
     }
@@ -1353,6 +1378,30 @@ class CereusDatasyncEngine {
         return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
     }
 
+    // Count a graph that now sits in a graph tree towards Tree Placed and log
+    // where it went. A graph not in any tree (yet) is not counted — a
+    // co-requisite graph, for one, is counted when its group places it.
+    private function countTreePlacement(int $graphId, string $hostname, string $ip, ?int $deviceId): void {
+        if ($graphId <= 0 || $this->dryRun) return;
+
+        $where = db_fetch_row_prepared(
+            'SELECT gt.name AS tree, COALESCE(p.title, \'\') AS branch
+             FROM graph_tree_items AS gti
+             INNER JOIN graph_tree AS gt ON gt.id = gti.graph_tree_id
+             LEFT JOIN graph_tree_items AS p ON p.id = gti.parent
+             WHERE gti.local_graph_id = ?
+             ORDER BY gti.id DESC
+             LIMIT 1',
+            [$graphId]
+        );
+        if (!cacti_sizeof($where)) return;
+
+        $this->stats['tree_placed']++;
+        $this->logDetail('tree_placed', $hostname, $ip, $deviceId,
+            'graph_id=' . $graphId . ' in "' . $where['tree'] . '"'
+            . ($where['branch'] !== '' ? ' under "' . $where['branch'] . '"' : ' at the tree root'));
+    }
+
     // The co-requisite group of a template. Only graph templates take part: a
     // host template places the device itself, so there is no graph to require.
     private function requireGroup(array $tpl): string {
@@ -1453,6 +1502,7 @@ class CereusDatasyncEngine {
                             $parent = create_all_header_nodes($graphId, $rule);
                             if (!api_tree_graph_exists($m['tree_id'], $parent, $graphId)) {
                                 create_graph_node($graphId, $parent, $rule);
+                                $this->countTreePlacement($graphId, '', '', null);
                                 $placed++;
                             }
                         }
@@ -2459,11 +2509,15 @@ class CereusDatasyncEngine {
             $this->preCreatedRunId = (int)db_fetch_insert_id();
         }
 
-        // Reflect "running" in the profile list badge immediately
-        db_execute_prepared(
-            'UPDATE plugin_cds_profiles SET last_run_at = NOW(), last_run_status = ? WHERE id = ?',
-            ['running', (int)$this->profile['id']]
-        );
+        // Reflect "running" in the profile list badge immediately. A dry run
+        // leaves it alone: last_run_at also drives the scheduler, and the
+        // profile's last run should be one that changed something.
+        if (!$this->dryRun) {
+            db_execute_prepared(
+                'UPDATE plugin_cds_profiles SET last_run_at = NOW(), last_run_status = ? WHERE id = ?',
+                ['running', (int)$this->profile['id']]
+            );
+        }
 
         return $this->preCreatedRunId;
     }
@@ -2494,6 +2548,10 @@ class CereusDatasyncEngine {
                 $this->runId,
             ]
         );
+
+        // The profile list's "Last Run" is the last run that changed something;
+        // a dry run is reviewed in the log instead of replacing it.
+        if ($this->dryRun) return;
 
         db_execute_prepared(
             'UPDATE plugin_cds_profiles SET last_run_at = NOW(), last_run_status = ?, last_run_stats = ? WHERE id = ?',

@@ -7,6 +7,7 @@ require_once(__DIR__ . '/lib/functions.php');
 require_once(__DIR__ . '/setup.php');
 cereus_datasync_setup_tables();
 cereus_datasync_check_upgrade();
+cereus_datasync_fail_stale_runs();
 
 if (!api_user_realm_auth('cereus_datasync.php')) {
     header('Location: ../../index.php');

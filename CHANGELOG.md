@@ -5,7 +5,30 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.0] - 2026-09-29
+## [1.7.1] - 2026-09-29
+
+### Fixed
+- **Run report: "Tree Placed" was always 0.** It only counted devices placed by
+  Host rules, while graph placements — made by Cacti's tree automation as each
+  graph is created, by co-requisite groups, and by aggregate and OID rules —
+  were never counted. Every graph that lands in a tree is now counted, with a
+  log line saying where it went.
+- **Run report: "Graphs Created" ignored aggregate and OID graphs.** New
+  aggregate graphs and OID graphs are now counted and logged as well.
+- **Dry runs: clicking a counter showed no entries.** Dry runs log
+  `added_dry`, `updated_dry` and so on; the counters and their lists now include
+  those.
+- **Dry runs over-reported additions.** Dry runs cannot do the SNMP interface
+  check, so devices that need it were counted as added without a word. They are
+  now marked as still needing the check, and the report says how many.
+- **Dry runs replaced the profile's "Last Run".** The profile list showed a dry
+  run's numbers as if devices had been added, and the dry run also moved the
+  timestamp the scheduler relies on. Dry runs now only appear in the log.
+- **Runs stuck as "Running" forever.** A run whose process was killed or lost to
+  a restart never recorded its end. Runs still queued or running after 12 hours
+  are now closed as failed with a reason.
+
+
 
 ### Added
 - **Help inside Cacti.** `HELP.md` covers installation, profiles, runs, every

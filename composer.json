@@ -5,7 +5,8 @@
 	"minimum-stability": "stable",
 	"require": {
 		"php": ">=7.4",
-		"phpoffice/phpspreadsheet": "^1.29"
+		"phpoffice/phpspreadsheet": "^1.29",
+		"erusev/parsedown": "^1.7"
 	},
 	"config": {
 		"platform": {

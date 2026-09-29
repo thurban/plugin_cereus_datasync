@@ -328,7 +328,7 @@ live device is left alone.
 | Sync profiles | 3 | unlimited |
 | Tree rule templates per profile | 10 | unlimited |
 | Scheduled (unattended) sync | — | ✓ |
-| **Site licence, per year (EUR)** | **€899** | **€1,599** |
+| **Site licence, per year** | **€899 / $899** | **€1,599 / $1,599** |
 
 A site licence covers one organisation: unlimited Cacti installations and devices,
 12 months of updates and support. Every licence starts with a 14-day free trial.

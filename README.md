@@ -70,7 +70,7 @@ at least a **Professional** licence.
 | Sync profiles                      |      3       | unlimited  |
 | Tree automation rules per profile  |     10       | unlimited  |
 | Scheduled (unattended) sync        |      —       |     ✓      |
-| Site licence, per year (USD)       |    $899      |   $1,599   |
+| Site licence, per year (EUR)       |    €899      |   €1,599   |
 
 ## Requirements
 

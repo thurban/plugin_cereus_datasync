@@ -54,6 +54,11 @@ A commercial [Cereus](https://urban-software.de) plugin for
 - **Sync log** — full audit log of every run with per-device detail and CSV
   export.
 
+## Documentation
+
+The full guide is [HELP.md](HELP.md). It is also available inside Cacti under
+**Console → Data Sync → Help**, and each plugin page links to its section.
+
 ## Licensing
 
 Cereus Data Sync is gated by the [Cereus License
@@ -65,6 +70,7 @@ at least a **Professional** licence.
 | Sync profiles                      |      3       | unlimited  |
 | Tree automation rules per profile  |     10       | unlimited  |
 | Scheduled (unattended) sync        |      —       |     ✓      |
+| Site licence, per year (USD)       |    $899      |   $1,599   |
 
 ## Requirements
 

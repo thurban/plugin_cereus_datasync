@@ -160,6 +160,8 @@ function cereus_datasync_edit_form(int $id): void {
 
     // ── General ──────────────────────────────────────────────────────────
     html_start_box($title, '100%', '', '3', 'center', '');
+    print '<tr class="even"><td colspan="2" style="padding:6px 15px;text-align:right;">'
+        . cereus_datasync_help_link('4-sync-profiles') . '</td></tr>';
     draw_edit_form(['config' => ['no_form_tag' => true], 'fields' => [
         'name' => [
             'friendly_name' => __('Profile Name', 'cereus_datasync'),

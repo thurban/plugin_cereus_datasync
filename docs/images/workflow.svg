@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="250" viewBox="0 0 920 250" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>How Cereus Data Sync works: inventory file, sync profile, sync run, and what a run changes in Cacti</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="920" height="250" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+
+  <!-- step boxes -->
+  <g>
+    <rect x="20" y="70" width="170" height="110" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+    <circle cx="40" cy="70" r="14" fill="#E8590C" stroke="#fff" stroke-width="2"/>
+    <text x="40" y="75" font-size="14" font-weight="700" fill="#fff" text-anchor="middle">1</text>
+    <text x="105" y="112" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle">Inventory file</text>
+    <text x="105" y="134" font-size="13" fill="#475569" text-anchor="middle">Excel (.xlsx), one</text>
+    <text x="105" y="152" font-size="13" fill="#475569" text-anchor="middle">device per row</text>
+  </g>
+  <line x1="194" y1="125" x2="226" y2="125" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g>
+    <rect x="230" y="70" width="180" height="110" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+    <circle cx="250" cy="70" r="14" fill="#E8590C" stroke="#fff" stroke-width="2"/>
+    <text x="250" y="75" font-size="14" font-weight="700" fill="#fff" text-anchor="middle">2</text>
+    <text x="320" y="112" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle">Sync profile</text>
+    <text x="320" y="134" font-size="13" fill="#475569" text-anchor="middle">columns, host templates,</text>
+    <text x="320" y="152" font-size="13" fill="#475569" text-anchor="middle">rules, schedule</text>
+  </g>
+  <line x1="414" y1="125" x2="446" y2="125" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g>
+    <rect x="450" y="70" width="170" height="110" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+    <circle cx="470" cy="70" r="14" fill="#E8590C" stroke="#fff" stroke-width="2"/>
+    <text x="470" y="75" font-size="14" font-weight="700" fill="#fff" text-anchor="middle">3</text>
+    <text x="535" y="112" font-size="15" font-weight="700" fill="#0f172a" text-anchor="middle">Sync run</text>
+    <text x="535" y="134" font-size="13" fill="#475569" text-anchor="middle">Dry run first,</text>
+    <text x="535" y="152" font-size="13" fill="#475569" text-anchor="middle">then Run</text>
+  </g>
+
+  <!-- outputs -->
+  <line x1="624" y1="125" x2="650" y2="60" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="624" y1="125" x2="650" y2="125" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="624" y1="125" x2="650" y2="190" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g font-size="13">
+    <rect x="654" y="34" width="246" height="52" rx="8" fill="#ecfdf3" stroke="#15803d" stroke-width="1.5"/>
+    <text x="668" y="56" font-size="14" font-weight="700" fill="#14532d">Devices</text>
+    <text x="668" y="75" fill="#166534">added, updated or tagged</text>
+
+    <rect x="654" y="99" width="246" height="52" rx="8" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5"/>
+    <text x="668" y="121" font-size="14" font-weight="700" fill="#1e3a8a">Graphs</text>
+    <text x="668" y="140" fill="#1e40af">WAN, OID and aggregate graphs</text>
+
+    <rect x="654" y="164" width="246" height="52" rx="8" fill="#f5f3ff" stroke="#6d28d9" stroke-width="1.5"/>
+    <text x="668" y="186" font-size="14" font-weight="700" fill="#4c1d95">Graph tree</text>
+    <text x="668" y="205" fill="#5b21b6">Region / Country / Site branches</text>
+  </g>
+
+  <text x="20" y="232" font-size="12" fill="#64748b">Every run is logged — open Log → Details to see what changed and why.</text>
+</svg>

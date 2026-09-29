@@ -60,6 +60,13 @@ function cereus_datasync_tab_bar(int $profileId, string $active): void {
         }
         print '<a href="' . $base . $key . '" style="' . $s . '">' . html_escape($label) . '</a>';
     }
+    $sections = [
+        'tree'      => '7-tree-placement-rules',
+        'aggregate' => '8-aggregate-graph-rules',
+        'oid'       => '9-oid-graph-rules',
+    ];
+    print '<span style="margin-left:auto;align-self:center;padding-right:6px;">'
+        . cereus_datasync_help_link($sections[$active] ?? '') . '</span>';
     print '</div>';
 }
 

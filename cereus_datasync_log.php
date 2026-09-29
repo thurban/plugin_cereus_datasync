@@ -59,6 +59,7 @@ function cereus_datasync_log_list(int $profileId): void {
 
     html_start_box($title, '100%', '', '3', 'center', '');
     print '<tr class="even"><td style="padding:6px 15px;">';
+    print '<span style="float:right;">' . cereus_datasync_help_link('5-running-a-sync') . '</span>';
     print '<a href="cereus_datasync.php" class="cds-link">&laquo; ' . __('Back to Profiles', 'cereus_datasync') . '</a>';
     if ($profileId) {
         print ' &nbsp; <a href="cereus_datasync_log.php?action=purge&profile_id=' . $profileId . '" class="cds-link-danger" onclick="return confirm(\'' . __('Delete all run history for this profile?', 'cereus_datasync') . '\')">' . __('Purge Log', 'cereus_datasync') . '</a>';

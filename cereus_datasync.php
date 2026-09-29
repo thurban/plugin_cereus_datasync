@@ -6,6 +6,7 @@ require_once(__DIR__ . '/lib/license_check.php');
 require_once(__DIR__ . '/lib/functions.php');
 require_once(__DIR__ . '/setup.php');
 cereus_datasync_setup_tables();
+cereus_datasync_check_upgrade();
 
 if (!api_user_realm_auth('cereus_datasync.php')) {
     header('Location: ../../index.php');
@@ -76,6 +77,7 @@ function cereus_datasync_list(): void {
             &#128196; <?php print __('Need to prepare an Excel file?', 'cereus_datasync'); ?>
             <a href="cereus_datasync_sample.php" class="cds-link" style="margin-left:6px;">&#11015; <?php print __('Download sample file', 'cereus_datasync'); ?></a>
             <span style="color:#94a3b8;margin-left:8px;"><?php print __('(30 sample devices, shows required columns and format)', 'cereus_datasync'); ?></span>
+            <span style="float:right;"><?php print cereus_datasync_help_link('2-quick-start'); ?></span>
         </td>
     </tr>
     <?php

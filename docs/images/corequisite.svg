@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="270" viewBox="0 0 920 270" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>Co-requisite group: a site is placed only when every template in the group has a matching graph there</title>
+  <rect x="0" y="0" width="920" height="270" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="20" y="32" font-size="15" font-weight="700" fill="#0f172a">Group "anyconnect-internet" = templates  Internet  +  AnyConnect</text>
+
+  <!-- Site A: both match -->
+  <g>
+    <rect x="20" y="52" width="430" height="196" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+    <text x="40" y="82" font-size="15" font-weight="700" fill="#0f172a">Site A</text>
+
+    <circle cx="52" cy="110" r="11" fill="#15803d"/>
+    <path d="M46 110 l4 4 l8 -9" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="72" y="115" font-size="14" fill="#0f172a">AnyConnect graph found</text>
+
+    <circle cx="52" cy="142" r="11" fill="#15803d"/>
+    <path d="M46 142 l4 4 l8 -9" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="72" y="147" font-size="14" fill="#0f172a">Internet graph found</text>
+
+    <rect x="36" y="172" width="398" height="60" rx="6" fill="#ecfdf3"/>
+    <text x="52" y="198" font-size="14" font-weight="700" fill="#14532d">Placed: branch created,</text>
+    <text x="52" y="218" font-size="14" fill="#166534">both graphs added to the tree</text>
+  </g>
+
+  <!-- Site B: one missing -->
+  <g>
+    <rect x="470" y="52" width="430" height="196" rx="8" fill="#ffffff" stroke="#b45309" stroke-width="2"/>
+    <text x="490" y="82" font-size="15" font-weight="700" fill="#0f172a">Site B</text>
+
+    <circle cx="502" cy="110" r="11" fill="#b91c1c"/>
+    <path d="M497 105 l10 10 M507 105 l-10 10" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+    <text x="522" y="115" font-size="14" fill="#0f172a">No AnyConnect graph</text>
+
+    <circle cx="502" cy="142" r="11" fill="#15803d"/>
+    <path d="M496 142 l4 4 l8 -9" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="522" y="147" font-size="14" fill="#0f172a">Internet graph found</text>
+
+    <rect x="486" y="172" width="398" height="60" rx="6" fill="#fff7ed"/>
+    <text x="502" y="198" font-size="14" font-weight="700" fill="#7c2d12">Nothing placed: no rule, no branch,</text>
+    <text x="502" y="218" font-size="14" fill="#9a3412">neither graph added to the tree</text>
+  </g>
+</svg>

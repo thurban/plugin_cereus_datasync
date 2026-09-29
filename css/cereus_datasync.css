@@ -126,3 +126,26 @@
     text-align: center;
     padding: 32px;
 }
+
+/* ── In-plugin help (HELP.md) ─────────────────────────────────────────── */
+.cds-help-link { white-space: nowrap; }
+.cds-help-cell { padding: 12px 20px 28px; }
+.cds-help-back { margin-bottom: 8px; font-size: 12px; }
+.cds-help { max-width: 1120px; font-size: 14px; line-height: 1.6; color: #1e293b; }
+.cds-help h1 { font-size: 24px; margin: 8px 0 12px; }
+.cds-help h2 { font-size: 19px; margin: 28px 0 10px; padding-bottom: 4px; border-bottom: 1px solid #e2e8f0; scroll-margin-top: 90px; }
+.cds-help h3 { font-size: 15px; margin: 20px 0 8px; scroll-margin-top: 90px; }
+.cds-help p, .cds-help ul, .cds-help ol { margin: 0 0 10px; }
+.cds-help li { margin: 2px 0; }
+.cds-help code { font-family: monospace; font-size: 13px; background: #f1f5f9; padding: 1px 4px; border-radius: 3px; }
+.cds-help pre { background: #f1f5f9; padding: 10px 12px; border-radius: 4px; overflow-x: auto; }
+.cds-help pre code { background: none; padding: 0; }
+.cds-help table { border-collapse: collapse; margin: 6px 0 14px; }
+.cds-help th, .cds-help td { border: 1px solid #cbd5e1; padding: 5px 10px; text-align: left; vertical-align: top; }
+.cds-help th { background: #f8fafc; }
+.cds-help hr { border: 0; border-top: 1px solid #e2e8f0; margin: 18px 0; }
+.cds-help a { color: #1d4ed8; }
+.cds-help img { display: block; max-width: 100%; height: auto; margin: 10px 0 12px; border: 1px solid #cbd5e1; border-radius: 6px; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08); }
+.cds-help blockquote { margin: 10px 0; padding: 8px 14px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 6px; }
+.cds-help blockquote p { margin: 0; }
+

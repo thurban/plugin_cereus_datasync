@@ -15,6 +15,12 @@ function cereus_datasync_draw_navigation($nav) {
         'url' => 'cereus_datasync.php',
         'level' => '1',
     );
+    $nav['cereus_datasync_help.php:'] = array(
+        'title' => __('Help', 'cereus_datasync'),
+        'mapping' => 'index.php:,cereus_datasync.php:',
+        'url' => 'cereus_datasync_help.php',
+        'level' => '2',
+    );
     $nav['cereus_datasync.php:edit'] = array(
         'title' => __('Edit Profile', 'cereus_datasync'),
         'mapping' => 'index.php:,cereus_datasync.php:',

@@ -5,6 +5,24 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-09-29
+
+### Added
+- **Help inside Cacti.** `HELP.md` covers installation, profiles, runs, every
+  rule type, cleanup, licensing and troubleshooting, and opens in Cacti under
+  **Data Sync → Help**. A Help link on the profile list, profile form, rule tabs
+  and sync log opens the matching section. Every screen is shown as a
+  screenshot with numbered markers that match the steps below it, plus diagrams
+  of the workflow and of co-requisite groups (`docs/images/`). Rendered with
+  Parsedown (bundled in `vendor/`, safe mode).
+
+### Fixed
+- **Plugin upgrades never ran.** Cacti 1.2 does not call a plugin's upgrade
+  function itself, so steps that only run on upgrade — registering hooks added
+  in 1.4.0, the one-time graph title refresh from 1.5.1 — were skipped. The
+  plugin now compares its version with the one Cacti recorded and runs the
+  upgrade when they differ.
+
 ## [1.6.0] - 2026-09-28
 
 ### Added

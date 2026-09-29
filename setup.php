@@ -10,7 +10,7 @@ function plugin_cereus_datasync_install() {
     api_plugin_register_hook('cereus_datasync', 'device_action_bottom', 'cereus_datasync_device_action_bottom', 'lib/device_delete_cleanup.php');
 
     api_plugin_register_realm('cereus_datasync',
-        'cereus_datasync.php,cereus_datasync_edit.php,cereus_datasync_rules.php,cereus_datasync_agrules.php,cereus_datasync_log.php,cereus_datasync_ajax.php,cereus_datasync_sample.php',
+        'cereus_datasync.php,cereus_datasync_edit.php,cereus_datasync_rules.php,cereus_datasync_agrules.php,cereus_datasync_log.php,cereus_datasync_ajax.php,cereus_datasync_sample.php,cereus_datasync_help.php',
         'Plugin: Cereus Data Sync', 1
     );
 
@@ -37,7 +37,32 @@ function plugin_cereus_datasync_version() {
 }
 
 function plugin_cereus_datasync_check_config() {
+    cereus_datasync_check_upgrade();
+
     return true;
+}
+
+/**
+ * Cacti 1.2 never calls a plugin's upgrade function itself, so compare the
+ * version in INFO with the one Cacti recorded and run the upgrade when they
+ * differ — the same check Thold does. The upgrade must be reached through
+ * plugin_cereus_datasync_upgrade(): Cacti only lets realms and hooks be
+ * registered from a function whose name contains install/upgrade/setup.
+ */
+function cereus_datasync_check_upgrade() {
+    $info = plugin_cereus_datasync_version();
+    $old  = db_fetch_cell("SELECT version FROM plugin_config WHERE directory = 'cereus_datasync'");
+
+    if ($old === false || $old === null || $old === '' || $old === $info['version']) {
+        return;
+    }
+
+    plugin_cereus_datasync_upgrade();
+
+    db_execute_prepared("UPDATE plugin_config SET version = ? WHERE directory = 'cereus_datasync'",
+        [$info['version']]);
+
+    cacti_log('cereus_datasync: upgraded from ' . $old . ' to ' . $info['version'], false, 'CEREUS_DATASYNC');
 }
 
 function plugin_cereus_datasync_upgrade() {
@@ -48,6 +73,13 @@ function plugin_cereus_datasync_upgrade() {
     api_plugin_register_hook('cereus_datasync', 'device_action_bottom', 'cereus_datasync_device_action_bottom', 'lib/device_delete_cleanup.php', true);
 
     cereus_datasync_backfill_title_caches();
+
+    // Refresh the realm's file list so pages added since install (the help
+    // page) are allowed for users who already hold the realm.
+    api_plugin_register_realm('cereus_datasync',
+        'cereus_datasync.php,cereus_datasync_edit.php,cereus_datasync_rules.php,cereus_datasync_agrules.php,cereus_datasync_log.php,cereus_datasync_ajax.php,cereus_datasync_sample.php,cereus_datasync_help.php',
+        'Plugin: Cereus Data Sync', 1
+    );
 
     return true;
 }

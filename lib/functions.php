@@ -587,3 +587,12 @@ function cereus_datasync_license_wall(): void {
     print '</td></tr>';
     html_end_box();
 }
+
+// A "Help" link to the in-plugin help, opened at the given HELP.md section
+// anchor (e.g. "7-tree-placement-rules"); an empty section opens the top.
+function cereus_datasync_help_link(string $section = ''): string {
+    $url = 'cereus_datasync_help.php' . ($section !== '' ? '?section=' . rawurlencode($section) : '');
+
+    return '<a href="' . html_escape($url) . '" class="cds-link cds-help-link">'
+        . '<i class="fa fa-question-circle" aria-hidden="true"></i> ' . __('Help', 'cereus_datasync') . '</a>';
+}

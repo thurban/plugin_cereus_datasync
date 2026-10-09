@@ -41,6 +41,11 @@ A commercial [Cereus](https://urban-software.de) plugin for
   path that does not exist yet is created during the run. Use `\/` for a literal
   slash inside one header name; leave a template's path blank to build the
   branch from Region / Country / Site.
+- **Branches from graph-title tags** — `{title:<tag>}` in a branch path is
+  filled per graph from `<tag>:<value>` in its title, so `Customers/{title:cp}`
+  files every graph tagged `cp:thompson-reuters` under `Customers /
+  thompson-reuters`. One rule is written per value and existing graphs are
+  placed in the same run.
 - **Co-requisite rule templates** — graph templates that share a group name are
   placed as a unit: at a location, their tree rules, branch and graph placements
   are created only when every template in the group matches at least one graph

@@ -18,6 +18,8 @@ class CereusDatasyncEngine {
     private array  $gatedRules     = [];   // group => location => template id => generated rule
     private array  $materialised   = [];   // template id|rule signature => true, per rule pass
     private array  $usedRuleNames  = [];   // generated rule name => rule signature, per rule pass
+    private array  $titleTagRules  = [];   // templates whose branch path names {title:<tag>}, per rule pass
+    private array  $titleRowCache  = [];   // rule signature => matching graph rows, per rule pass
     private array  $aggRules  = [];
     private array  $oidRules  = [];
     private int    $runId     = 0;
@@ -356,8 +358,9 @@ class CereusDatasyncEngine {
                 $this->applyAggregateRules();
                 $this->applyOidGraphRules();
 
-                // Every graph of this run exists now, so co-requisite groups can
-                // finally be judged per location.
+                // Every graph of this run exists now, so graph-title tags can be
+                // read and co-requisite groups finally judged per location.
+                $this->applyTitleTagTemplates();
                 $this->applyCoRequisiteGroups();
             }
 
@@ -1120,6 +1123,8 @@ class CereusDatasyncEngine {
         // conditions overwritten — once per location.
         $this->materialised  = [];
         $this->usedRuleNames = [];
+        $this->titleTagRules = [];
+        $this->titleRowCache = [];
         foreach ($templates as $tpl) {
             if ($this->requireGroup($tpl) !== '') {
                 $this->reqGroups[$this->requireGroup($tpl)][] = (int)$tpl['id'];
@@ -1204,9 +1209,29 @@ class CereusDatasyncEngine {
         }
 
         $leafType    = (int)$tpl['leaf_type'] ?: 2;
-        $hostGrouping = (int)$tpl['host_grouping'] ?: 1;
         $items       = $this->buildRuleItems($conditions, $subs);
-        $group       = $this->requireGroup($tpl);
+
+        // A {title:<tag>} level depends on the titles of the graphs the template
+        // matches, which only all exist once this run has created its graphs —
+        // applyTitleTagTemplates() writes one rule per tag value then.
+        if (cereus_datasync_branch_title_tags((string)($tpl['branch_path'] ?? ''))) {
+            if ($leafType !== TREE_ITEM_TYPE_GRAPH) {
+                $this->logDetail('auto_rule_skip', '', '', null,
+                    'Template "' . $tpl['name'] . '": {title:...} in the branch path needs leaf type Graph — rule not generated');
+
+                return;
+            }
+
+            $this->titleTagRules[] = [
+                'tpl'      => $tpl,
+                'items'    => $items,
+                'parts'    => $locationParts,
+                'device'   => $device,
+                'location' => $locationKey,
+            ];
+
+            return;
+        }
 
         $branch = $this->templateBranchTitles($tpl, $device, $locationParts);
         if (empty($branch)) {
@@ -1216,6 +1241,19 @@ class CereusDatasyncEngine {
 
             return;
         }
+
+        $this->materialiseTemplateRule($tpl, $branch, $items, $locationParts, $locationKey);
+    }
+
+    // Write one generated rule for a template at one location, or hand it to
+    // applyCoRequisiteGroups() when the template is gated. $placeNow are graphs
+    // that already exist and are placed straight away — Cacti itself only places
+    // a graph when it is created.
+    private function materialiseTemplateRule(array $tpl, array $branch, array $items, array $locationParts, string $locationKey, array $placeNow = []): void {
+        $treeId       = (int)$tpl['tree_id'];
+        $leafType     = (int)$tpl['leaf_type'] ?: 2;
+        $hostGrouping = (int)$tpl['host_grouping'] ?: 1;
+        $group        = $this->requireGroup($tpl);
 
         // The branch and the resolved conditions together are the rule's identity:
         // locations that land on the same branch with the same conditions share one
@@ -1240,9 +1278,10 @@ class CereusDatasyncEngine {
 
         // A co-requisite rule is not written yet: whether its location qualifies
         // is only known once this run's graphs exist. applyCoRequisiteGroups()
-        // writes it — branch and all — only when the whole group matches.
+        // writes it — branch and all — only when the whole group matches. A
+        // {title:<tag>} template yields one rule per tag value, hence the name key.
         if ($group !== '') {
-            $this->gatedRules[$group][implode('|', $locationParts)][(int)$tpl['id']] = [
+            $this->gatedRules[$group][implode('|', $locationParts)][(int)$tpl['id']][$ruleName] = [
                 'name'     => $ruleName,
                 'tpl'      => $tpl,
                 'branch'   => $branch,
@@ -1261,8 +1300,106 @@ class CereusDatasyncEngine {
         $ruleId = $this->saveTreeRule($ruleName, $treeId, $leafItemId, $leafType, $hostGrouping, $items);
         if (!$ruleId) return;
 
+        $placed = cacti_sizeof($placeNow) ? $this->placeGraphs($ruleId, $treeId, $placeNow) : 0;
+
         $this->logDetail('auto_rule', '', '', null,
-            'Materialised "' . $ruleName . '" (rule_id=' . $ruleId . ', ' . count($items) . ' tokens)');
+            'Materialised "' . $ruleName . '" (rule_id=' . $ruleId . ', ' . count($items) . ' tokens'
+            . ($placed ? ', ' . $placed . ' existing graph(s) placed' : '') . ')');
+    }
+
+    // Put existing graphs where a stored tree rule wants them. Returns how many
+    // were newly placed.
+    private function placeGraphs(int $ruleId, int $treeId, array $graphIds): int {
+        $rule = db_fetch_row_prepared('SELECT * FROM automation_tree_rules WHERE id = ?', [$ruleId]);
+        if (!cacti_sizeof($rule)) return 0;
+
+        $placed = 0;
+        foreach ($graphIds as $graphId) {
+            $parent = create_all_header_nodes($graphId, $rule);
+            if (!api_tree_graph_exists($treeId, $parent, $graphId)) {
+                create_graph_node($graphId, $parent, $rule);
+                $this->countTreePlacement($graphId, '', '', null);
+                $placed++;
+            }
+        }
+
+        return $placed;
+    }
+
+    /**
+     * Write the rules of templates whose branch path names {title:<tag>}. The
+     * graphs a template matches at a location are grouped by their tag values,
+     * and each value gets its own rule: the template's conditions AND a title
+     * test for exactly that value, filed under the branch the value names. So
+     * "cp:thompson-reuters" in a title puts the graph under "thompson-reuters".
+     * Graphs without the tag are left alone; a new value gets its rule on the
+     * next sync that sees it.
+     */
+    private function applyTitleTagTemplates(): void {
+        global $config;
+
+        if (empty($this->titleTagRules)) return;
+
+        include_once $config['base_path'] . '/lib/api_automation.php';
+        include_once $config['base_path'] . '/lib/api_tree.php';
+
+        foreach ($this->titleTagRules as $t) {
+            $tpl  = $t['tpl'];
+            $tags = cereus_datasync_branch_title_tags((string)$tpl['branch_path']);
+
+            // Locations whose conditions resolve alike would run the same query.
+            $key = md5(json_encode($t['items']));
+            if (!isset($this->titleRowCache[$key])) {
+                $this->titleRowCache[$key] = $this->matchingGraphRows($t['items']);
+            }
+
+            // tag values => graph ids carrying exactly those values
+            $byValues = [];
+            foreach ($this->titleRowCache[$key] as $row) {
+                $values = [];
+                foreach ($tags as $tag) {
+                    $value = cereus_datasync_title_tag_value((string)$row['title_cache'], $tag);
+                    if ($value === '') continue 2;
+                    $values[$tag] = $value;
+                }
+                $byValues[json_encode($values)][] = (int)$row['id'];
+            }
+
+            foreach ($byValues as $json => $graphIds) {
+                $values = json_decode($json, true);
+
+                // The template's own conditions are bracketed so a top-level OR
+                // in them cannot swallow the title test.
+                $items   = [];
+                $items[] = ['operation' => AUTOMATION_OPER_LEFT_BRACKET, 'field' => '', 'operator' => 0, 'pattern' => ''];
+                foreach ($t['items'] as $item) {
+                    $items[] = $item;
+                }
+                $items[] = ['operation' => AUTOMATION_OPER_RIGHT_BRACKET, 'field' => '', 'operator' => 0, 'pattern' => ''];
+
+                $subs = [];
+                foreach ($values as $tag => $value) {
+                    $items[] = [
+                        'operation' => AUTOMATION_OPER_AND,
+                        'field'     => 'gtg.title_cache',
+                        'operator'  => AUTOMATION_OP_REGEXP,
+                        'pattern'   => cereus_datasync_title_tag_regexp($tag, $value),
+                    ];
+                    $subs['{title:' . $tag . '}'] = $value;
+                }
+
+                $branch = $this->templateBranchTitles($tpl, $t['device'], $t['parts'], $subs);
+                if (empty($branch)) {
+                    $this->logDetail('auto_rule_skip', '', '', null,
+                        'Template "' . $tpl['name'] . '" at "' . $t['location'] . '": branch path "'
+                        . trim((string)$tpl['branch_path']) . '" resolved to nothing — rule not generated');
+
+                    continue;
+                }
+
+                $this->materialiseTemplateRule($tpl, $branch, $items, $t['parts'], $t['location'], $graphIds);
+            }
+        }
     }
 
     // Reuse the rule if it already exists (dedup by generated name), otherwise create it.
@@ -1362,9 +1499,16 @@ class CereusDatasyncEngine {
     // Graphs a token stream would match, evaluated the way Cacti's
     // get_matching_graphs() does but without a stored rule behind it.
     private function matchingGraphIds(array $items): array {
+        $rows = $this->matchingGraphRows($items);
+
+        return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
+    }
+
+    // The id and title of every graph a token stream matches.
+    private function matchingGraphRows(array $items): array {
         if (!cacti_sizeof($items)) return [];
 
-        $rows = db_fetch_assoc('SELECT DISTINCT gl.id
+        $rows = db_fetch_assoc('SELECT DISTINCT gl.id, gtg.title_cache
             FROM graph_local AS gl
             INNER JOIN graph_templates_graph AS gtg
             LEFT JOIN graph_templates AS gt
@@ -1375,7 +1519,7 @@ class CereusDatasyncEngine {
             ON (h.host_template_id=ht.id)
             WHERE gl.id=gtg.local_graph_id AND ' . build_rule_item_filter($items), false);
 
-        return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
+        return cacti_sizeof($rows) ? $rows : [];
     }
 
     // Count a graph that now sits in a graph tree towards Tree Placed and log
@@ -1417,7 +1561,7 @@ class CereusDatasyncEngine {
     // always was. Placeholders take the untruncated values — the 40-char clamp on
     // {site} exists only to match h.location and would rename long site branches —
     // and a level whose placeholder is empty is dropped.
-    private function templateBranchTitles(array $tpl, array $device, array $locationParts): array {
+    private function templateBranchTitles(array $tpl, array $device, array $locationParts, array $titleSubs = []): array {
         $path = trim((string)($tpl['branch_path'] ?? ''));
 
         if ($path === '') {
@@ -1426,7 +1570,7 @@ class CereusDatasyncEngine {
 
         // A "/" inside a value is part of that one header, not a new level.
         $subs = [];
-        foreach ($this->branchSubs($device) as $placeholder => $value) {
+        foreach ($this->branchSubs($device) + $titleSubs as $placeholder => $value) {
             $subs[$placeholder] = str_replace('/', '\\/', $value);
         }
 
@@ -1477,9 +1621,13 @@ class CereusDatasyncEngine {
                         continue;
                     }
 
-                    $matches[$tplId] = $this->matchingGraphIds($members[$tplId]['items']);
+                    $any = false;
+                    foreach ($members[$tplId] as $ruleName => $m) {
+                        $matches[$tplId][$ruleName] = $this->matchingGraphIds($m['items']);
+                        $any = $any || cacti_sizeof($matches[$tplId][$ruleName]);
+                    }
 
-                    if (!cacti_sizeof($matches[$tplId])) {
+                    if (!$any) {
                         $missing[] = $tplId;
                     }
                 }
@@ -1488,26 +1636,19 @@ class CereusDatasyncEngine {
                 $placed    = 0;
                 $removed   = 0;
 
-                foreach ($members as $tplId => $m) {
-                    if ($satisfied) {
-                        $leafItemId = $this->templateBranch($m['tree_id'], $m['branch']);
-                        if (!$leafItemId) continue;
+                foreach ($members as $tplId => $rules) {
+                    foreach ($rules as $ruleName => $m) {
+                        if ($satisfied) {
+                            $leafItemId = $this->templateBranch($m['tree_id'], $m['branch']);
+                            if (!$leafItemId) continue;
 
-                        $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items']);
-                        if (!$ruleId) continue;
+                            $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items']);
+                            if (!$ruleId) continue;
 
-                        $rule = db_fetch_row_prepared('SELECT * FROM automation_tree_rules WHERE id = ?', [$ruleId]);
-
-                        foreach ($matches[$tplId] as $graphId) {
-                            $parent = create_all_header_nodes($graphId, $rule);
-                            if (!api_tree_graph_exists($m['tree_id'], $parent, $graphId)) {
-                                create_graph_node($graphId, $parent, $rule);
-                                $this->countTreePlacement($graphId, '', '', null);
-                                $placed++;
-                            }
+                            $placed += $this->placeGraphs($ruleId, $m['tree_id'], $matches[$tplId][$ruleName]);
+                        } else {
+                            $removed += $this->deleteTreeRule($m['name'], $m['items']);
                         }
-                    } else {
-                        $removed += $this->deleteTreeRule($m['name'], $m['items']);
                     }
                 }
 
@@ -1518,7 +1659,7 @@ class CereusDatasyncEngine {
                 } else {
                     $names = [];
                     foreach ($missing as $tplId) {
-                        $names[] = isset($members[$tplId]) ? $members[$tplId]['tpl']['name'] : ('#' . $tplId);
+                        $names[] = isset($members[$tplId]) ? reset($members[$tplId])['tpl']['name'] : ('#' . $tplId);
                     }
 
                     $this->logDetail('auto_rule_skip', '', '', null,
@@ -1692,6 +1833,7 @@ class CereusDatasyncEngine {
             // Cacti places those as each graph is created. Only a Host rule asks
             // the plugin to put the device itself in the tree.
             if ((int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
+            if (cereus_datasync_branch_title_tags((string)$rule['branch_path'])) continue;
 
             if (!$this->matchTreeRule($rule, $device)) continue;
 
@@ -1748,6 +1890,7 @@ class CereusDatasyncEngine {
         foreach ($this->treeRules as $rule) {
             $treeId = (int)$rule['tree_id'];
             if (!$treeId || (int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
+            if (cereus_datasync_branch_title_tags((string)$rule['branch_path'])) continue;
             if ($this->matchTreeRule($rule, $device)) {
                 $keepParents[$treeId . ':' . $this->ruleBranchFor($rule, $device, true)] = true;
             }
@@ -1757,6 +1900,7 @@ class CereusDatasyncEngine {
         foreach ($this->treeRules as $rule) {
             $treeId = (int)$rule['tree_id'];
             if (!$treeId || (int)$rule['leaf_type'] !== TREE_ITEM_TYPE_HOST) continue;
+            if (cereus_datasync_branch_title_tags((string)$rule['branch_path'])) continue;
 
             $parentItem = $this->ruleBranchFor($rule, $device, false);
             if ($parentItem < 0) continue;   // branch does not exist — nothing to remove

@@ -273,6 +273,46 @@ function cereus_datasync_split_branch_path(string $path): array {
     return $result;
 }
 
+/**
+ * The graph-title tags a branch path names, e.g. "Customers/{title:cp}" => ['cp'].
+ * Each {title:<tag>} level is filled per graph from "<tag>:<value>" in its title.
+ */
+function cereus_datasync_branch_title_tags(string $path): array {
+    if (!preg_match_all('/\{title:([A-Za-z0-9_-]+)\}/', $path, $m)) {
+        return [];
+    }
+
+    return array_values(array_unique($m[1]));
+}
+
+/**
+ * The value of "<tag>:" in a graph title. A value may contain spaces
+ * ("uid:third party") and runs up to the next " <word>:" or the end of the title.
+ * Returns '' when the tag is absent or empty.
+ */
+function cereus_datasync_title_tag_value(string $title, string $tag): string {
+    $re = '/(?:^|\s)' . preg_quote($tag, '/') . ':(.*?)(?=\s+[A-Za-z0-9_-]+:|\s*$)/u';
+    if (!preg_match($re, $title, $m)) {
+        return '';
+    }
+
+    return trim($m[1]);
+}
+
+/**
+ * A MySQL REGEXP matching a title whose "<tag>:" has exactly this value — the
+ * same boundaries cereus_datasync_title_tag_value() reads, so the generated rule
+ * keeps "cp:acme" from also catching "cp:acme-labs".
+ */
+function cereus_datasync_title_tag_regexp(string $tag, string $value): string {
+    $quote = function (string $s): string {
+        return preg_replace('/[\\\\^$.|?*+()\[\]{}]/', '\\\\$0', $s);
+    };
+
+    return '(^|[[:space:]])' . $quote($tag) . ':' . $quote($value)
+        . '([[:space:]]+[[:alnum:]_-]+:|[[:space:]]*$)';
+}
+
 // graph_tree_items.title is VARCHAR(255) — count characters, not bytes, so a
 // multi-byte site name is never cut mid-character.
 function cereus_datasync_truncate_title(string $title): string {

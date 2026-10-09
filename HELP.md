@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.7.1.
+one. This guide covers version 1.8.0.
 
 ---
 
@@ -247,11 +247,31 @@ Every **(** needs its **)** — otherwise the template is skipped and the log sa
 | `{region}/{country}` | one branch per country |
 | `Internet/{region}` | a collector branch per region |
 | `EMEA/Germany/Munich` | always this fixed branch |
+| `Customers/{title:cp}` | one branch per `cp:` value in the graph titles |
 
 - Missing branches are **created during the run**.
 - A level whose placeholder is empty for a location is left out.
 - Write `\/` for a slash inside one header name (`Plant A\/B`).
 - Locations landing on the same branch with the same conditions **share one rule**.
+
+### Branches from graph-title tags
+
+`{title:<tag>}` in a branch path takes its value from `<tag>:<value>` in each
+graph's title. A value may contain spaces and runs up to the next `word:` tag:
+
+```
+eu-chgva-oft-wem01 - Gi1/0/18 - -WAN- uid:third party cp:thompson-reuters cid:gva/gva/le-176623
+```
+
+With branch path `{title:cp}` this graph goes to **`thompson-reuters`**; with
+`Customers/{title:cp}` to **`Customers / thompson-reuters`**. A condition such as
+**`gtg.title_cache` contains `cp:`** keeps the template to tagged graphs.
+
+- The sync writes **one Cacti tree rule per value** (`Auto[<name>]: thompson-reuters`)
+  and places the graphs that already exist; Cacti places new ones as they are created.
+- A value seen for the first time gets its branch and rule on the next sync.
+- Graphs without the tag are left alone. A `/` in a value stays in one header.
+- Works with leaf type **Graph** only.
 
 ### Co-requisite groups — "only if the other one is there too"
 

@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.8.0.
+one. This guide covers version 1.9.0.
 
 ---
 
@@ -154,6 +154,23 @@ To start a new profile from an existing one, use **Copy** in the profile list.
 **Dry** reports what would change, **Run** makes the changes. Both run in the
 background; the page stays usable and updates on its own.
 
+### Applying rules without an import
+
+**Apply Rules** runs only the rules, on what is already in Cacti — the inventory
+file is not read and no device is added, changed or flagged. Use it after editing a
+rule, or when graphs got new titles.
+
+- Rule templates are applied for every **site that has devices**; the location comes
+  from the site name the sync wrote (`region/country/site`).
+- Graphs that **already exist** and match a template are placed straight away.
+- Host rules, aggregate rules, OID rules and co-requisite groups are applied as well.
+- The run appears in the log as *(rules only)* and does not change the profile's
+  *Last Run* or its schedule.
+
+To run it without clicking, set **Apply Rules Schedule** in the profile's
+*Schedule* section — every poll cycle, hourly, daily or weekly, independent of the
+sync's own schedule (e.g. sync daily at 02:00, apply rules hourly).
+
 ### The sync log
 
 ![Sync log](docs/images/08-run-log.png)
@@ -169,13 +186,28 @@ A run that cannot start at all (for example because a library is missing) ends a
 
 ![Run details](docs/images/09-run-details.png)
 
-1. **Excel input** — rows in the file, valid rows, devices in Cacti.
-2. **Device results** — added, updated, marked for deletion, **skipped**, failed,
-   dropped. Click a box to list just those devices and the reason.
-3. **Cleanup** — sites and branches flagged as empty, or revived.
-4. **Graph results** — WAN interfaces found, graphs created, tree placements.
+The **Statistics** block sums the run up in one line; click it to fold the block
+away (the page remembers this). Opened, it lists every counter with a small
+spark chart of the same counter over the profile's last 20 runs of the same kind
+(sync, dry run or Apply Rules); hover a chart for the values.
 
-Below the boxes: one line per action, with the device and the reason. Export it as
+1. **Inventory file** — rows in the file, valid and dropped rows, devices in Cacti.
+2. **Devices** — added, updated, marked for deletion, **skipped**, failed.
+3. **Graphs** — WAN interfaces found, graphs created, graphs placed on a tree,
+   graphs skipped and graph errors.
+4. **Tree rules & branches** — tree rules created, updated, or **already there
+   unchanged**, rules skipped (with the reason: no matching graph, unresolved
+   `{site_id}`, …), co-requisite groups met, branches created, placements moved.
+5. **Aggregate & OID rules** — rules run, skipped, and errors.
+6. **Cleanup** — sites and branches flagged as empty, or revived.
+
+Click a counter to list just those log lines; click it again to show everything.
+Counters that are 0 now and were 0 in every earlier run are hidden — **Show
+empty counters** brings them back. Dry runs do not evaluate rule templates, so
+section 4 stays at 0 for them. The **Rules** column of the sync log sums
+section 4 up per run.
+
+Below the statistics: one line per action, with the device and the reason. Export it as
 CSV, or remove old runs with **Purge Log**.
 
 ---
@@ -199,8 +231,9 @@ CSV, or remove old runs with **Purge Log**.
 ## 7. Tree placement rules
 
 **Rules → Tree Placement Rules.** A *rule template* is written once; the sync turns it
-into a Cacti tree rule for every location in the file. From then on, Cacti puts each
-new graph in the right branch the moment it is created.
+into a Cacti tree rule for every location in the file where it matches at least one
+graph (or device, for a Host leaf). From then on, Cacti puts each new graph in the right
+branch the moment it is created.
 
 ![Tree rule template](docs/images/05-tree-rule-template.png)
 
@@ -249,7 +282,9 @@ Every **(** needs its **)** — otherwise the template is skipped and the log sa
 | `EMEA/Germany/Munich` | always this fixed branch |
 | `Customers/{title:cp}` | one branch per `cp:` value in the graph titles |
 
-- Missing branches are **created during the run**.
+- Missing branches are **created during the run** — but only for a rule that matches
+  at least one graph (or device). A location with no match gets no branch and no rule;
+  the first sync that finds a match creates both.
 - A level whose placeholder is empty for a location is left out.
 - Write `\/` for a slash inside one header name (`Plant A\/B`).
 - Locations landing on the same branch with the same conditions **share one rule**.
@@ -363,7 +398,7 @@ A site licence covers one organisation: unlimited Cacti installations and device
 | "PhpSpreadsheet vendor autoload not found" | `vendor/` is missing: copy the whole plugin directory, or run `composer install` in it. |
 | "Composer detected issues in your platform" | The `vendor/` was built for a newer PHP. Use the one shipped with the plugin (PHP 7.4+). |
 | Devices are **Skipped** | Details shows why: a device function without a host template, or no interface matching the pattern. |
-| A template created no rule for a site | The log says why: no site for `{site_id}`, branch path empty, or unbalanced parentheses. |
+| A template created no rule for a site | The log says why: no matching graph or device, no site for `{site_id}`, branch path empty, or unbalanced parentheses. |
 | Graphs are not placed in the tree | Check **Enable Auto Tree Rules** in the profile, that the template is enabled, and that its conditions match the graph titles. For co-requisite groups, the log names the missing template. |
 | A graph keeps an old device name | Its title refers to a data query index that no longer exists — re-index the device or recreate the graph. |
 

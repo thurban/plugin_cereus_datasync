@@ -76,20 +76,41 @@
     }
 
     // ── Schedule section: hide hour/day fields when not relevant ────────────
-    function initScheduleToggle() {
-        var schedSel = document.getElementById('schedule_type');
+    // The sync schedule and the Apply Rules schedule share the same layout.
+    function applyScheduleVisibility(prefix) {
+        var schedSel = document.getElementById(prefix + 'schedule_type');
         if (!schedSel) return;
 
-        function applyVisibility() {
-            var val = schedSel.value;
-            var hourRow = document.getElementById('row_schedule_hour');
-            var wdayRow = document.getElementById('row_schedule_wday');
-            if (hourRow) hourRow.style.display = (val === 'daily' || val === 'weekly') ? '' : 'none';
-            if (wdayRow) wdayRow.style.display = (val === 'weekly') ? '' : 'none';
-        }
+        var val = schedSel.value;
+        var hourRow = document.getElementById('row_' + prefix + 'schedule_hour');
+        var wdayRow = document.getElementById('row_' + prefix + 'schedule_wday');
+        if (hourRow) hourRow.style.display = (val === 'daily' || val === 'weekly') ? '' : 'none';
+        if (wdayRow) wdayRow.style.display = (val === 'weekly') ? '' : 'none';
+    }
 
-        schedSel.addEventListener('change', applyVisibility);
-        applyVisibility();
+    var scheduleBound = false;
+    function initScheduleToggle() {
+        applyScheduleVisibility('');
+        applyScheduleVisibility('rules_');
+
+        // Bound once on the document: Cacti re-renders pages over AJAX, and its
+        // styled dropdowns fire jQuery change events that a native listener
+        // does not always receive.
+        if (scheduleBound) return;
+        scheduleBound = true;
+
+        var handler = function (e) {
+            var id = (e.target && e.target.id) || '';
+            if (id === 'schedule_type' || id === 'rules_schedule_type') {
+                applyScheduleVisibility(id === 'rules_schedule_type' ? 'rules_' : '');
+            }
+        };
+
+        if (window.jQuery) {
+            window.jQuery(document).on('change selectmenuchange', '#schedule_type, #rules_schedule_type', handler);
+        } else {
+            document.addEventListener('change', handler);
+        }
     }
 
     // ── MutationObserver for AJAX navigation ──────────────────────────────────

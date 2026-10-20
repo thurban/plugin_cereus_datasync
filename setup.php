@@ -59,8 +59,9 @@ function cereus_datasync_check_upgrade() {
 
     plugin_cereus_datasync_upgrade();
 
-    db_execute_prepared("UPDATE plugin_config SET version = ? WHERE directory = 'cereus_datasync'",
-        [$info['version']]);
+    // Name, author and homepage are copied from INFO at install only; refresh them too.
+    db_execute_prepared("UPDATE plugin_config SET version = ?, name = ?, author = ?, webpage = ? WHERE directory = 'cereus_datasync'",
+        [$info['version'], $info['longname'], $info['author'], $info['homepage']]);
 
     cacti_log('cereus_datasync: upgraded from ' . $old . ' to ' . $info['version'], false, 'CEREUS_DATASYNC');
 }
@@ -142,8 +143,13 @@ function cereus_datasync_page_head() {
     $info = parse_ini_file($config['base_path'] . '/plugins/cereus_datasync/INFO', true);
     $ver  = isset($info['info']['version']) ? $info['info']['version'] : '0';
 
-    print '<link rel="stylesheet" type="text/css" href="' . $base . 'css/cereus_datasync.css?v=' . urlencode($ver) . '">' . PHP_EOL;
-    print '<script src="' . $base . 'js/cereus_datasync.js?v=' . urlencode($ver) . '"></script>' . PHP_EOL;
+    // The file's mtime as well, so a change within one version is picked up too.
+    $dir = $config['base_path'] . '/plugins/cereus_datasync/';
+    $css = urlencode($ver . '.' . @filemtime($dir . 'css/cereus_datasync.css'));
+    $js  = urlencode($ver . '.' . @filemtime($dir . 'js/cereus_datasync.js'));
+
+    print '<link rel="stylesheet" type="text/css" href="' . $base . 'css/cereus_datasync.css?v=' . $css . '">' . PHP_EOL;
+    print '<script src="' . $base . 'js/cereus_datasync.js?v=' . $js . '"></script>' . PHP_EOL;
 
     // Signal to the frontend whether the device-delete empty-container cleanup
     // option should be offered (Professional tier and up).
@@ -164,38 +170,18 @@ function cereus_datasync_poller_bottom() {
     require_once $config['base_path'] . '/plugins/cereus_datasync/lib/SyncEngine.php';
 
     $now = time();
-    $hour = (int)date('G', $now);
-    $wday = (int)date('w', $now);
 
     $profiles = db_fetch_assoc(
-        "SELECT * FROM plugin_cds_profiles WHERE enabled = 'on' AND schedule_type != 'manual' ORDER BY id"
+        "SELECT * FROM plugin_cds_profiles
+         WHERE enabled = 'on' AND (schedule_type != 'manual' OR rules_schedule_type != 'manual')
+         ORDER BY id"
     );
 
     if (!cacti_sizeof($profiles)) return;
 
     foreach ($profiles as $profile) {
-        $due = false;
-        switch ($profile['schedule_type']) {
-            case 'every_poller':
-                $due = true;
-                break;
-            case 'hourly':
-                // Run once per hour on the 0-minute mark (poller fires every minute, check last run)
-                $last = strtotime($profile['last_run_at'] ?? '1970-01-01');
-                $due  = ($now - $last) >= 3500;
-                break;
-            case 'daily':
-                $due = ($hour == (int)$profile['schedule_hour']) &&
-                       (empty($profile['last_run_at']) || date('Y-m-d', strtotime($profile['last_run_at'])) !== date('Y-m-d', $now));
-                break;
-            case 'weekly':
-                $due = ($wday == (int)$profile['schedule_wday']) &&
-                       ($hour == (int)$profile['schedule_hour']) &&
-                       (empty($profile['last_run_at']) || date('Y-W', strtotime($profile['last_run_at'])) !== date('Y-W', $now));
-                break;
-        }
-
-        if ($due) {
+        if (cereus_datasync_schedule_due($profile['schedule_type'], (int)$profile['schedule_hour'],
+                (int)$profile['schedule_wday'], $profile['last_run_at'], $now)) {
             try {
                 $engine = new CereusDatasyncEngine();
                 $engine->run((int)$profile['id'], false);
@@ -203,7 +189,41 @@ function cereus_datasync_poller_bottom() {
                 cacti_log('cereus_datasync: poller error for profile ' . $profile['id'] . ': ' . $e->getMessage(), false, 'SYSTEM');
             }
         }
+
+        if (cereus_datasync_schedule_due($profile['rules_schedule_type'] ?? 'manual', (int)($profile['rules_schedule_hour'] ?? 3),
+                (int)($profile['rules_schedule_wday'] ?? 1), $profile['rules_last_run_at'] ?? null, $now)) {
+            try {
+                $engine = new CereusDatasyncEngine();
+                $engine->runRulesOnly((int)$profile['id']);
+            } catch (Exception $e) {
+                cacti_log('cereus_datasync: poller error applying rules for profile ' . $profile['id'] . ': ' . $e->getMessage(), false, 'SYSTEM');
+            }
+        }
     }
+}
+
+// Whether a schedule is due now, given when it last ran.
+function cereus_datasync_schedule_due(string $type, int $schedHour, int $schedWday, ?string $lastRunAt, int $now): bool {
+    $hour = (int)date('G', $now);
+    $wday = (int)date('w', $now);
+
+    switch ($type) {
+        case 'every_poller':
+            return true;
+        case 'hourly':
+            // Run once per hour (poller fires every minute, check last run)
+            $last = strtotime($lastRunAt ?? '1970-01-01');
+            return ($now - $last) >= 3500;
+        case 'daily':
+            return ($hour == $schedHour) &&
+                   (empty($lastRunAt) || date('Y-m-d', strtotime($lastRunAt)) !== date('Y-m-d', $now));
+        case 'weekly':
+            return ($wday == $schedWday) &&
+                   ($hour == $schedHour) &&
+                   (empty($lastRunAt) || date('Y-W', strtotime($lastRunAt)) !== date('Y-W', $now));
+    }
+
+    return false;
 }
 
 // ─── Table creation ──────────────────────────────────────────────────────────
@@ -247,6 +267,10 @@ function cereus_datasync_setup_tables() {
         last_run_at                TIMESTAMP        NULL DEFAULT NULL,
         last_run_status            VARCHAR(20)      NOT NULL DEFAULT '',
         last_run_stats             JSON,
+        rules_schedule_type        VARCHAR(20)      NOT NULL DEFAULT 'manual',
+        rules_schedule_hour        TINYINT UNSIGNED NOT NULL DEFAULT 3,
+        rules_schedule_wday        TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        rules_last_run_at          TIMESTAMP        NULL DEFAULT NULL,
         created                    TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
         modified                   TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -530,6 +554,15 @@ function cereus_datasync_setup_tables() {
             ADD COLUMN auto_graph_rules    TINYINT(1)   NOT NULL DEFAULT 0 AFTER deletion_skip_localhost,
             ADD COLUMN auto_create_graphs  TINYINT(1)   NOT NULL DEFAULT 0 AFTER auto_graph_rules,
             ADD COLUMN graph_query_type_id INT UNSIGNED NOT NULL DEFAULT 0 AFTER auto_create_graphs");
+    }
+
+    // Migration: a separate schedule for rules-only runs
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_profiles LIKE 'rules_schedule_type'"))) {
+        db_execute("ALTER TABLE plugin_cds_profiles
+            ADD COLUMN rules_schedule_type VARCHAR(20)      NOT NULL DEFAULT 'manual' AFTER last_run_stats,
+            ADD COLUMN rules_schedule_hour TINYINT UNSIGNED NOT NULL DEFAULT 3 AFTER rules_schedule_type,
+            ADD COLUMN rules_schedule_wday TINYINT UNSIGNED NOT NULL DEFAULT 1 AFTER rules_schedule_hour,
+            ADD COLUMN rules_last_run_at   TIMESTAMP        NULL DEFAULT NULL AFTER rules_schedule_wday");
     }
 
     // Migration: add graph creation columns to existing installs

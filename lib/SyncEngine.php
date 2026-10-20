@@ -20,10 +20,13 @@ class CereusDatasyncEngine {
     private array  $usedRuleNames  = [];   // generated rule name => rule signature, per rule pass
     private array  $titleTagRules  = [];   // templates whose branch path names {title:<tag>}, per rule pass
     private array  $titleRowCache  = [];   // rule signature => matching graph rows, per rule pass
+    private array  $pendingRules   = [];   // generated rules awaiting a match check, per rule pass
+    private array  $treeNames      = [];   // graph_tree id => name, for log lines
     private array  $aggRules  = [];
     private array  $oidRules  = [];
     private int    $runId     = 0;
     private bool   $dryRun    = false;
+    private bool   $rulesOnly = false;   // runRulesOnly(): no inventory file, existing graphs placed too
     private array  $stats     = [
         'excel_total'        => 0, 'excel_raw_total'    => 0,
         'excel_skipped_load' => 0, 'cacti_total'        => 0,
@@ -155,10 +158,9 @@ class CereusDatasyncEngine {
                 }
             }
 
-            // ── Auto graph rules — build tree branches and Cacti automation rules
-            //    BEFORE devices are added so that when createWanGraphs() calls
-            //    create_complete_graph_from_template(), automation_hook_graph_create_tree()
-            //    fires against rules that already exist and places graphs immediately.
+            // ── Auto graph rules — resolve the rule templates per location now;
+            //    the Cacti rules and their branches are written after the graphs
+            //    exist (applyPendingTemplateRules()), and only where something matches.
             if (!$this->dryRun) {
                 $this->autoGraphRulesForAllLocations($excelDevices);
             }
@@ -361,6 +363,7 @@ class CereusDatasyncEngine {
                 // Every graph of this run exists now, so graph-title tags can be
                 // read and co-requisite groups finally judged per location.
                 $this->applyTitleTagTemplates();
+                $this->applyPendingTemplateRules();
                 $this->applyCoRequisiteGroups();
             }
 
@@ -378,6 +381,111 @@ class CereusDatasyncEngine {
         }
 
         return $this->stats;
+    }
+
+    /**
+     * Apply the profile's rules to what is already in Cacti, without reading the
+     * inventory file: rule templates for every site that has devices, Host rules
+     * for those devices, aggregate and OID rules. Nothing is added, updated or
+     * flagged. Unlike a sync, the graphs that already match a template are placed
+     * too — Cacti only places a graph when it is created.
+     */
+    public function runRulesOnly(int $profileId, int $existingRunId = 0): array {
+        global $config;
+
+        $this->rulesOnly = true;
+        if ($existingRunId) {
+            $this->preCreatedRunId = $existingRunId;
+        }
+
+        db_execute("SET SESSION net_read_timeout = 300");
+        db_execute("SET SESSION net_write_timeout = 300");
+
+        if (!$this->loadProfile($profileId)) {
+            throw new \RuntimeException("Profile $profileId not found");
+        }
+
+        $this->treeRules = $this->loadTreeRules();
+        $this->aggRules  = $this->loadAggRules();
+        $this->oidRules  = $this->loadOidRules();
+
+        include_once $config['base_path'] . '/lib/api_automation.php';
+        include_once $config['base_path'] . '/lib/api_tree.php';
+
+        $this->runId = $this->startRun('(rules only)');
+
+        // The rules schedule runs off this, so stamp it now — a long run must
+        // not be started again by the next poll cycle.
+        db_execute_prepared('UPDATE plugin_cds_profiles SET rules_last_run_at = NOW() WHERE id = ?', [$profileId]);
+
+        try {
+            $devices = $this->cactiDevicesBySite();
+            $this->stats['cacti_total'] = count($devices);
+
+            if (empty($this->profile['auto_graph_rules'])) {
+                $this->logDetail('auto_rule_skip', '', '', null,
+                    'Auto graph rules are off for this profile — rule templates not applied');
+            }
+
+            $this->autoGraphRulesForAllLocations($devices);
+
+            foreach ($devices as $device) {
+                $this->stats['tree_placed'] += $this->applyTreeRules((int)$device['id'], $device);
+            }
+
+            $this->applyAggregateRules();
+            $this->applyOidGraphRules();
+            $this->applyTitleTagTemplates();
+            $this->applyPendingTemplateRules();
+            $this->applyCoRequisiteGroups();
+
+            $this->flushStats();
+            $this->finishRun('completed');
+        } catch (\Throwable $e) {
+            $this->finishRun('failed', $e->getMessage());
+            throw $e;
+        }
+
+        return $this->stats;
+    }
+
+    /**
+     * Cacti's devices in the inventory-row shape the rules read. The location
+     * comes from the device's site, whose name the sync writes as
+     * "region/country/site"; sites flagged with the deletion tag are skipped.
+     */
+    private function cactiDevicesBySite(): array {
+        $rows = db_fetch_assoc('SELECT h.id, h.description, h.hostname, s.name AS site_name
+            FROM host AS h
+            INNER JOIN sites AS s ON s.id = h.site_id
+            ORDER BY s.name, h.description');
+        if (!cacti_sizeof($rows)) return [];
+
+        $tag     = trim((string)($this->profile['deletion_tag'] ?? ''));
+        $devices = [];
+        foreach ($rows as $row) {
+            if ($tag !== '' && (strpos((string)$row['site_name'], $tag) !== false || strpos((string)$row['description'], $tag) !== false)) {
+                continue;
+            }
+
+            $parts = array_values(array_filter(array_map('trim', explode('/', (string)$row['site_name'])), 'strlen'));
+            if (empty($parts)) continue;
+
+            $site    = count($parts) > 2 ? implode('/', array_slice($parts, 2)) : $parts[count($parts) - 1];
+            $country = count($parts) > 1 ? $parts[count($parts) > 2 ? 1 : 0] : '';
+            $region  = count($parts) > 2 ? $parts[0] : '';
+
+            $devices[] = [
+                'id'       => (int)$row['id'],
+                'hostname' => (string)$row['description'],
+                'ip'       => (string)$row['hostname'],
+                'region'   => $region,
+                'country'  => $country,
+                'site'     => $site,
+            ];
+        }
+
+        return $devices;
     }
 
     // ─── Profile loading ─────────────────────────────────────────────────────
@@ -1125,6 +1233,7 @@ class CereusDatasyncEngine {
         $this->usedRuleNames = [];
         $this->titleTagRules = [];
         $this->titleRowCache = [];
+        $this->pendingRules  = [];
         foreach ($templates as $tpl) {
             if ($this->requireGroup($tpl) !== '') {
                 $this->reqGroups[$this->requireGroup($tpl)][] = (int)$tpl['id'];
@@ -1245,8 +1354,9 @@ class CereusDatasyncEngine {
         $this->materialiseTemplateRule($tpl, $branch, $items, $locationParts, $locationKey);
     }
 
-    // Write one generated rule for a template at one location, or hand it to
-    // applyCoRequisiteGroups() when the template is gated. $placeNow are graphs
+    // Queue one generated rule for a template at one location — for
+    // applyPendingTemplateRules(), or applyCoRequisiteGroups() when the template
+    // is gated. $placeNow are graphs
     // that already exist and are placed straight away — Cacti itself only places
     // a graph when it is created.
     private function materialiseTemplateRule(array $tpl, array $branch, array $items, array $locationParts, string $locationKey, array $placeNow = []): void {
@@ -1294,17 +1404,79 @@ class CereusDatasyncEngine {
             return;
         }
 
-        $leafItemId = $this->templateBranch($treeId, $branch);
-        if (!$leafItemId) return;
+        // Whether the rule matches anything is only known once this run's graphs
+        // exist, so applyPendingTemplateRules() writes it — and creates its
+        // branch — then, and only when at least one object matches.
+        $this->pendingRules[] = [
+            'name'     => $ruleName,
+            'tpl'      => $tpl,
+            'branch'   => $branch,
+            'items'    => $items,
+            'tree_id'  => $treeId,
+            'leaf'     => $leafType,
+            'grouping' => $hostGrouping,
+            'location' => $locationKey,
+            'place'    => $placeNow,
+        ];
+    }
 
-        $ruleId = $this->saveTreeRule($ruleName, $treeId, $leafItemId, $leafType, $hostGrouping, $items);
-        if (!$ruleId) return;
+    /**
+     * Write the generated rules of ungated templates. A rule that matches no
+     * graph (or, for a Host leaf, no device) gets neither a branch nor a rule,
+     * and one an earlier run wrote is deleted; the next sync that finds a match
+     * writes it. Matching graphs are placed straight away.
+     */
+    private function applyPendingTemplateRules(): void {
+        global $config;
 
-        $placed = cacti_sizeof($placeNow) ? $this->placeGraphs($ruleId, $treeId, $placeNow) : 0;
+        if (empty($this->pendingRules)) return;
 
-        $this->logDetail('auto_rule', '', '', null,
-            'Materialised "' . $ruleName . '" (rule_id=' . $ruleId . ', ' . count($items) . ' tokens'
-            . ($placed ? ', ' . $placed . ' existing graph(s) placed' : '') . ')');
+        include_once $config['base_path'] . '/lib/api_automation.php';
+        include_once $config['base_path'] . '/lib/api_tree.php';
+
+        foreach ($this->pendingRules as $m) {
+            $isGraph = ($m['leaf'] === TREE_ITEM_TYPE_GRAPH);
+
+            if ($isGraph) {
+                $matches = cacti_sizeof($m['place']) ? $m['place'] : $this->matchingGraphIds($m['items']);
+            } else {
+                $matches = $this->matchingHostIds($m['items']);
+            }
+
+            if (!cacti_sizeof($matches)) {
+                $removed = $this->deleteTreeRule($m['name'], $m['items']);
+
+                $this->logDetail('auto_rule_skip', '', '', null,
+                    'Template "' . $m['tpl']['name'] . '" at "' . $m['location'] . '": no matching '
+                    . ($isGraph ? 'graph' : 'device') . ' — no rule or branch created'
+                    . ($removed ? ', ' . $removed . ' earlier placement(s) removed' : ''));
+
+                continue;
+            }
+
+            $leafItemId = $this->templateBranch($m['tree_id'], $m['branch']);
+            if (!$leafItemId) continue;
+
+            $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items'], $state);
+            if (!$ruleId) continue;
+
+            $placed = $isGraph ? $this->placeGraphs($ruleId, $m['tree_id'], $matches) : 0;
+
+            $this->logRuleSaved($state, $m['name'], $ruleId, count($m['items']), count($matches), $placed);
+        }
+
+        $this->pendingRules = [];
+    }
+
+    // Log a generated rule after saveTreeRule(): new, rewritten, or already in
+    // Cacti exactly as wanted.
+    private function logRuleSaved(string $state, string $name, int $ruleId, int $tokens, int $matched, int $placed, string $prefix = ''): void {
+        $actions = ['created' => 'auto_rule', 'updated' => 'auto_rule_updated', 'exists' => 'auto_rule_exists'];
+        $verbs   = ['created' => 'Created', 'updated' => 'Updated', 'exists' => 'Already exists, unchanged:'];
+
+        $this->logDetail($actions[$state] ?? 'auto_rule', '', '', null,
+            $prefix . ($verbs[$state] ?? 'Saved') . ' "' . $name . '" (rule_id=' . $ruleId . ', ' . $tokens . ' tokens, '
+            . $matched . ' match(es), ' . $placed . ' graph(s) newly placed)');
     }
 
     // Put existing graphs where a stored tree rule wants them. Returns how many
@@ -1405,12 +1577,49 @@ class CereusDatasyncEngine {
     // Reuse the rule if it already exists (dedup by generated name), otherwise create it.
     // Reuse lets edited conditions — including newly added OR/parenthesis grouping — take
     // effect on the next sync instead of being permanently frozen at first creation.
-    // Returns the automation_tree_rules id, or 0 on failure.
-    private function saveTreeRule(string $ruleName, int $treeId, int $leafItemId, int $leafType, int $hostGrouping, array $items): int {
-        $ruleId = (int)db_fetch_cell_prepared(
-            'SELECT id FROM automation_tree_rules WHERE name = ?',
+    // Returns the automation_tree_rules id, or 0 on failure. $state is 'created',
+    // 'updated', or 'exists' when the stored rule already matched and was left alone.
+    private function saveTreeRule(string $ruleName, int $treeId, int $leafItemId, int $leafType, int $hostGrouping, array $items, ?string &$state = null): int {
+        $state  = '';
+        $existing = db_fetch_row_prepared(
+            'SELECT id, tree_id, tree_item_id, leaf_type, host_grouping_type FROM automation_tree_rules WHERE name = ?',
             [$ruleName]
         );
+        $ruleId = cacti_sizeof($existing) ? (int)$existing['id'] : 0;
+
+        if ($ruleId) {
+            $stored = db_fetch_assoc_prepared(
+                'SELECT operation, field, operator, pattern FROM automation_match_rule_items
+                  WHERE rule_id = ? AND rule_type = ? ORDER BY sequence',
+                [$ruleId, AUTOMATION_RULE_TYPE_TREE_MATCH]
+            );
+
+            $same = (int)$existing['tree_id'] === $treeId
+                && (int)$existing['tree_item_id'] === $leafItemId
+                && (int)$existing['leaf_type'] === $leafType
+                && (int)$existing['host_grouping_type'] === $hostGrouping
+                && cacti_sizeof($stored) === cacti_sizeof($items);
+
+            if ($same) {
+                foreach (array_values($items) as $i => $item) {
+                    if ((int)$stored[$i]['operation'] !== (int)$item['operation']
+                        || (string)$stored[$i]['field'] !== (string)$item['field']
+                        || (int)$stored[$i]['operator'] !== (int)$item['operator']
+                        || (string)$stored[$i]['pattern'] !== (string)$item['pattern']) {
+                        $same = false;
+                        break;
+                    }
+                }
+            }
+
+            if ($same) {
+                $state = 'exists';
+
+                return $ruleId;
+            }
+
+            $state = 'updated';
+        }
 
         if ($ruleId) {
             db_execute_prepared(
@@ -1431,8 +1640,13 @@ class CereusDatasyncEngine {
                 [$ruleName, $treeId, $leafItemId, $leafType, $hostGrouping]
             );
             $ruleId = (int)db_fetch_insert_id();
+            $state  = 'created';
         }
-        if (!$ruleId) return 0;
+        if (!$ruleId) {
+            $state = '';
+
+            return 0;
+        }
 
         $seq = 1;
         foreach ($items as $item) {
@@ -1500,6 +1714,19 @@ class CereusDatasyncEngine {
     // get_matching_graphs() does but without a stored rule behind it.
     private function matchingGraphIds(array $items): array {
         $rows = $this->matchingGraphRows($items);
+
+        return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
+    }
+
+    // Devices a token stream matches, the way Cacti's get_matching_hosts() does.
+    private function matchingHostIds(array $items): array {
+        if (!cacti_sizeof($items)) return [];
+
+        $rows = db_fetch_assoc('SELECT h.id
+            FROM host AS h
+            LEFT JOIN host_template AS ht
+            ON (h.host_template_id=ht.id)
+            WHERE h.deleted = "" AND (' . build_rule_item_filter($items) . ')', false);
 
         return cacti_sizeof($rows) ? array_map('intval', array_column($rows, 'id')) : [];
     }
@@ -1581,17 +1808,35 @@ class CereusDatasyncEngine {
     // Returns the deepest header's tree item id, or 0 on failure.
     private function templateBranch(int $treeId, array $titles): int {
         $leafItemId = 0;
+        $created    = [];
         foreach ($titles as $title) {
-            $leafItemId = $this->findOrCreateBranch($treeId, $leafItemId, $title);
+            $leafItemId = $this->findOrCreateBranch($treeId, $leafItemId, $title, $new);
             if (!$leafItemId) {
                 $this->logDetail('tree_error', '', '', null,
                     'could not create branch "' . implode(' / ', $titles) . '" in tree #' . $treeId);
 
                 return 0;
             }
+            if ($new) $created[] = $title;
         }
 
+        $this->logBranchCreated($treeId, implode(' / ', $titles), $created);
+
         return $leafItemId;
+    }
+
+    // Log the headers a branch lookup had to create. Nothing is logged when the
+    // whole branch already existed.
+    private function logBranchCreated(int $treeId, string $path, array $created): void {
+        if (empty($created)) return;
+
+        if (!isset($this->treeNames[$treeId])) {
+            $this->treeNames[$treeId] = (string)db_fetch_cell_prepared('SELECT name FROM graph_tree WHERE id = ?', [$treeId]);
+        }
+
+        $this->logDetail('branch_created', '', '', null,
+            'branch "' . $path . '" in "' . ($this->treeNames[$treeId] ?: ('tree #' . $treeId)) . '"'
+            . ' — new header(s): ' . implode(', ', $created));
     }
 
     /**
@@ -1642,10 +1887,14 @@ class CereusDatasyncEngine {
                             $leafItemId = $this->templateBranch($m['tree_id'], $m['branch']);
                             if (!$leafItemId) continue;
 
-                            $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items']);
+                            $ruleId = $this->saveTreeRule($m['name'], $m['tree_id'], $leafItemId, $m['leaf'], $m['grouping'], $m['items'], $state);
                             if (!$ruleId) continue;
 
-                            $placed += $this->placeGraphs($ruleId, $m['tree_id'], $matches[$tplId][$ruleName]);
+                            $n       = $this->placeGraphs($ruleId, $m['tree_id'], $matches[$tplId][$ruleName]);
+                            $placed += $n;
+
+                            $this->logRuleSaved($state, $m['name'], $ruleId, count($m['items']),
+                                count($matches[$tplId][$ruleName]), $n, 'Co-requisite group "' . $group . '": ');
                         } else {
                             $removed += $this->deleteTreeRule($m['name'], $m['items']);
                         }
@@ -1653,7 +1902,7 @@ class CereusDatasyncEngine {
                 }
 
                 if ($satisfied) {
-                    $this->logDetail('auto_rule', '', '', null,
+                    $this->logDetail('coreq_ok', '', '', null,
                         'Co-requisite group "' . $group . '" at "' . str_replace('|', '/', $location) . '": all '
                         . count($this->reqGroups[$group]) . ' templates match — rules written, ' . $placed . ' graph(s) placed');
                 } else {
@@ -1727,9 +1976,9 @@ class CereusDatasyncEngine {
 
     // Find an existing header branch or create a new one in the target tree.
     // Returns the branch's graph_tree_items.id, or 0 on failure.
-    private function findOrCreateBranch(int $treeId, int $parentId, string $title): int {
+    private function findOrCreateBranch(int $treeId, int $parentId, string $title, ?bool &$created = null): int {
         return cereus_datasync_find_or_create_branch(
-            $treeId, $parentId, $title, (string)($this->profile['deletion_tag'] ?? '')
+            $treeId, $parentId, $title, (string)($this->profile['deletion_tag'] ?? ''), $created
         );
     }
 
@@ -1749,8 +1998,10 @@ class CereusDatasyncEngine {
         }
 
         $itemId = cereus_datasync_resolve_branch_path(
-            $treeId, $path, (string)($this->profile['deletion_tag'] ?? '')
+            $treeId, $path, (string)($this->profile['deletion_tag'] ?? ''), $created
         );
+
+        $this->logBranchCreated($treeId, $path, $created);
 
         if (!$itemId) {
             $this->logDetail('tree_error', '', '', null,
@@ -2656,7 +2907,7 @@ class CereusDatasyncEngine {
         // Reflect "running" in the profile list badge immediately. A dry run
         // leaves it alone: last_run_at also drives the scheduler, and the
         // profile's last run should be one that changed something.
-        if (!$this->dryRun) {
+        if (!$this->dryRun && !$this->rulesOnly) {
             db_execute_prepared(
                 'UPDATE plugin_cds_profiles SET last_run_at = NOW(), last_run_status = ? WHERE id = ?',
                 ['running', (int)$this->profile['id']]
@@ -2695,7 +2946,7 @@ class CereusDatasyncEngine {
 
         // The profile list's "Last Run" is the last run that changed something;
         // a dry run is reviewed in the log instead of replacing it.
-        if ($this->dryRun) return;
+        if ($this->dryRun || $this->rulesOnly) return;
 
         db_execute_prepared(
             'UPDATE plugin_cds_profiles SET last_run_at = NOW(), last_run_status = ?, last_run_stats = ? WHERE id = ?',

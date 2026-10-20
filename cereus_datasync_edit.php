@@ -64,6 +64,9 @@ function cereus_datasync_save(): void {
         'schedule_type'         => get_nfilter_request_var('schedule_type', 'manual'),
         'schedule_hour'         => (int)get_nfilter_request_var('schedule_hour', 2),
         'schedule_wday'         => (int)get_nfilter_request_var('schedule_wday', 1),
+        'rules_schedule_type'   => get_nfilter_request_var('rules_schedule_type', 'manual'),
+        'rules_schedule_hour'   => (int)get_nfilter_request_var('rules_schedule_hour', 3),
+        'rules_schedule_wday'   => (int)get_nfilter_request_var('rules_schedule_wday', 1),
         'snmp_check_l2'         => isset($_POST['snmp_check_l2']) ? 1 : 0,
         'snmp_wan_pattern'      => trim(get_nfilter_request_var('snmp_wan_pattern', '-WAN-')) ?: '-WAN-',
         'snmp_timeout_ms'       => max(500, (int)get_nfilter_request_var('snmp_timeout_ms', 2000)),
@@ -88,6 +91,14 @@ function cereus_datasync_save(): void {
     // Scheduling requires Enterprise
     if (!cereus_datasync_has_scheduling() && $data['schedule_type'] !== 'manual') {
         $data['schedule_type'] = 'manual';
+    }
+    if (!cereus_datasync_has_scheduling() && $data['rules_schedule_type'] !== 'manual') {
+        $data['rules_schedule_type'] = 'manual';
+    }
+    foreach (['schedule_type', 'rules_schedule_type'] as $k) {
+        if (!in_array($data[$k], ['manual', 'every_poller', 'hourly', 'daily', 'weekly'], true)) {
+            $data[$k] = 'manual';
+        }
     }
 
     if ($id) {
@@ -132,6 +143,7 @@ function cereus_datasync_edit_form(int $id): void {
         'excel_path' => '', 'excel_file_mode' => 'latest_in_dir',
         'sheet_name' => 'Sheet1', 'data_start_row' => 4,
         'schedule_type' => 'manual', 'schedule_hour' => 2, 'schedule_wday' => 1,
+        'rules_schedule_type' => 'manual', 'rules_schedule_hour' => 3, 'rules_schedule_wday' => 1,
         'snmp_check_l2' => 1, 'snmp_wan_pattern' => '-WAN-', 'snmp_timeout_ms' => 2000,
         'snmp_enable_parallel' => 0, 'snmp_parallel_workers' => 20,
         'default_snmp_version' => 2, 'default_snmp_community' => 'public',
@@ -375,6 +387,27 @@ function cereus_datasync_edit_form(int $id): void {
             'method'        => 'drop_array',
             'array'         => $wdays,
             'value'         => $r['schedule_wday'],
+        ],
+        'rules_schedule_type' => [
+            'friendly_name' => __('Apply Rules Schedule', 'cereus_datasync'),
+            'description'   => __('When to apply the rules to the devices and graphs already in Cacti, without importing the inventory file — the scheduled form of the Apply Rules action. Requires Enterprise for non-manual options.', 'cereus_datasync'),
+            'method'        => 'drop_array',
+            'array'         => $hasScheduling ? $schedTypes : ['manual' => __('Manual only', 'cereus_datasync')],
+            'value'         => $r['rules_schedule_type'],
+        ],
+        'rules_schedule_hour' => [
+            'friendly_name' => __('Apply Rules Hour', 'cereus_datasync'),
+            'description'   => __('For daily/weekly rule schedules, the hour to run at.', 'cereus_datasync'),
+            'method'        => 'drop_array',
+            'array'         => $hours,
+            'value'         => $r['rules_schedule_hour'],
+        ],
+        'rules_schedule_wday' => [
+            'friendly_name' => __('Apply Rules Day', 'cereus_datasync'),
+            'description'   => __('For weekly rule schedules, the day to run on.', 'cereus_datasync'),
+            'method'        => 'drop_array',
+            'array'         => $wdays,
+            'value'         => $r['rules_schedule_wday'],
         ],
     ]]);
     html_end_box();

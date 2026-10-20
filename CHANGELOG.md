@@ -5,6 +5,39 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-10-20
+
+### Added
+- **Apply Rules without an import.** A new *Apply Rules* action runs the tree,
+  aggregate and OID rules against the devices and graphs already in Cacti,
+  without reading the inventory file. Existing graphs that match a template are
+  placed straight away; the profile's last run and schedule are left alone.
+  It has its own **Apply Rules Schedule** per profile, independent of the sync
+  schedule.
+- **Run report: compact statistics with trends.** The run report's counters are
+  one collapsible *Statistics* block: a one-line summary, and per counter a small
+  number and a spark chart over the profile's last runs of the same kind. New
+  counters cover tree rules (created, updated, already existing unchanged,
+  skipped), co-requisite groups met, branches created, placements moved, and
+  aggregate and OID rules. Every counter opens its log lines. The sync log has a
+  *Rules* column, and the run window lists the rule counts. A generated rule
+  that already matches is no longer rewritten on every run.
+
+### Changed
+- **Declares its dependency on Cereus License.** `INFO` now has
+  `requires = cereus_license:1.0.0`, so Cacti installs and enables Data Sync only
+  when the licence plugin is installed.
+- Author is now "Urban-Software.de / Thomas Urban", as in the other Cereus
+  plugins. The upgrade also refreshes the name, author and homepage Cacti shows
+  on its Plugins page.
+
+### Fixed
+- **Rule templates created empty branches.** A template's branch and Cacti tree
+  rule were written for every location, whether or not anything matched there.
+  They are now written after the run's graphs exist, and only where the rule
+  matches at least one graph (or device, for a Host leaf); matching graphs are
+  placed straight away. A generated rule that no longer matches is removed.
+
 ## [1.8.0] - 2026-10-09
 
 ### Added

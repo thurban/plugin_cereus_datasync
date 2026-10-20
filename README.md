@@ -38,7 +38,8 @@ A commercial [Cereus](https://urban-software.de) plugin for
   with the same conditions share one rule.
 - **Auto-created branch paths** — rule templates and aggregate rules name their
   target branch as a path such as `EMEA/Germany/Munich`, and any header in that
-  path that does not exist yet is created during the run. Use `\/` for a literal
+  path that does not exist yet is created during the run — for a rule template,
+  only when the rule matches at least one graph or device. Use `\/` for a literal
   slash inside one header name; leave a template's path blank to build the
   branch from Region / Country / Site.
 - **Branches from graph-title tags** — `{title:<tag>}` in a branch path is
@@ -46,6 +47,13 @@ A commercial [Cereus](https://urban-software.de) plugin for
   files every graph tagged `cp:thompson-reuters` under `Customers /
   thompson-reuters`. One rule is written per value and existing graphs are
   placed in the same run.
+- **Apply Rules without an import** — run the tree, aggregate and OID rules
+  against what is already in Cacti, without reading the inventory file; existing
+  matching graphs are placed straight away. Runs on demand or on its own schedule.
+- **Run report with trends** — a collapsible statistics block per run: devices,
+  graphs, tree rules (created, updated, already existing, skipped), branches
+  created, aggregate/OID rules and cleanup, each with a spark chart over the
+  profile's recent runs. Every counter opens its log lines.
 - **Co-requisite rule templates** — graph templates that share a group name are
   placed as a unit: at a location, their tree rules, branch and graph placements
   are created only when every template in the group matches at least one graph
@@ -96,4 +104,4 @@ at least a **Professional** licence.
 
 ## License
 
-GPL-2.0-or-later. © Thomas Urban / Urban-Software.de
+GPL-2.0-or-later. © Urban-Software.de / Thomas Urban

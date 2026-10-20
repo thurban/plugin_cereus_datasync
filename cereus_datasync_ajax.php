@@ -92,6 +92,7 @@ switch ($action) {
     case 'trigger_run': {
         $profileId = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
         $dryRun    = (int)get_nfilter_request_var('dry_run', '0') === 1;
+        $rulesOnly = !$dryRun && (int)get_nfilter_request_var('rules_only', '0') === 1;
 
         if (!$profileId) {
             print json_encode(['error' => 'Missing profile_id']);
@@ -107,8 +108,8 @@ switch ($action) {
         // Pre-create the run record so the UI can poll it immediately
         db_execute_prepared(
             "INSERT INTO plugin_cds_runs (profile_id, profile_name, started_at, status, dry_run, excel_file)
-             VALUES (?, ?, NOW(), 'queued', ?, '')",
-            [$profileId, $profile['name'], $dryRun ? 1 : 0]
+             VALUES (?, ?, NOW(), 'queued', ?, ?)",
+            [$profileId, $profile['name'], $dryRun ? 1 : 0, $rulesOnly ? '(rules only)' : '']
         );
         $runId = (int)db_fetch_insert_id();
 
@@ -119,7 +120,8 @@ switch ($action) {
         $cmd     = escapeshellcmd($phpBin) . ' ' . escapeshellarg($script)
                  . ' --profile=' . $profileId
                  . ' --run='     . $runId
-                 . ($dryRun ? ' --dry' : '');
+                 . ($dryRun ? ' --dry' : '')
+                 . ($rulesOnly ? ' --rules' : '');
 
         // Redirect stdout+stderr to null; '&' detaches the process
         if (PHP_OS_FAMILY === 'Windows') {
@@ -161,6 +163,7 @@ switch ($action) {
                 'graphs_created'     => (int)$run['graphs_created'],
                 'checking'           => (int)($run['checking'] ?? 0),
             ],
+            'details' => cereus_datasync_run_action_counts($runId),
             'error'  => $run['error_message'] ?: null,
         ]);
         break;

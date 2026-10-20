@@ -13,11 +13,13 @@ require('./include/cli_check.php');
 $profileId     = 0;
 $runId         = 0;
 $dryRun        = false;
+$rulesOnly     = false;
 
 foreach (array_slice($argv, 1) as $arg) {
     if (preg_match('/^--profile=(\d+)$/', $arg, $m)) $profileId = (int)$m[1];
     if (preg_match('/^--run=(\d+)$/',     $arg, $m)) $runId     = (int)$m[1];
     if ($arg === '--dry') $dryRun = true;
+    if ($arg === '--rules') $rulesOnly = true;
 }
 
 if (!$profileId || !$runId) {
@@ -54,7 +56,11 @@ require_once('./plugins/cereus_datasync/lib/SyncEngine.php');
 
 try {
     $engine = new CereusDatasyncEngine();
-    $engine->run($profileId, $dryRun, $runId);
+    if ($rulesOnly) {
+        $engine->runRulesOnly($profileId, $runId);
+    } else {
+        $engine->run($profileId, $dryRun, $runId);
+    }
 } catch (\Throwable $e) {
     cereus_datasync_runner_fail($runId, '[' . get_class($e) . '] ' . $e->getMessage());
     exit(1);

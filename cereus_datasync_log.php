@@ -85,6 +85,7 @@ function cereus_datasync_log_list(int $profileId): void {
         'nosort6'     => ['display' => __('Skipped', 'cereus_datasync')],
         'nosort7'     => ['display' => __('Failed', 'cereus_datasync')],
         'nosort8'     => ['display' => __('Tree', 'cereus_datasync')],
+        'nosort11'    => ['display' => __('Rules', 'cereus_datasync')],
         'nosort9'     => ['display' => __('Duration', 'cereus_datasync')],
         'nosort10'    => ['display' => ''],
     ];
@@ -117,6 +118,7 @@ function cereus_datasync_log_list(int $profileId): void {
             form_selectable_cell($row['skipped'], $row['id']);
             form_selectable_cell('<span style="color:' . ($row['failed'] > 0 ? '#dc2626' : '#888') . ';font-weight:600;">' . $row['failed'] . '</span>', $row['id']);
             form_selectable_cell($row['tree_placed'], $row['id']);
+            form_selectable_cell(cereus_datasync_log_rule_summary(cereus_datasync_run_action_counts((int)$row['id'])), $row['id']);
             form_selectable_cell($duration, $row['id']);
             print '<td style="text-align:right;white-space:nowrap;">';
             print '<a href="cereus_datasync_log.php?action=view&run_id=' . $row['id'] . '" class="cds-link">' . __('Details', 'cereus_datasync') . '</a>';
@@ -124,7 +126,7 @@ function cereus_datasync_log_list(int $profileId): void {
             form_end_row();
         }
     } else {
-        print '<tr><td colspan="13"><em>' . __('No sync runs yet.', 'cereus_datasync') . '</em></td></tr>';
+        print '<tr><td colspan="14"><em>' . __('No sync runs yet.', 'cereus_datasync') . '</em></td></tr>';
     }
 
     html_end_box(false);
@@ -165,28 +167,75 @@ function cereus_datasync_log_detail(int $runId): void {
         $secs = strtotime($run['completed_at']) - strtotime($run['started_at']);
         $duration = $secs < 60 ? $secs . 's' : floor($secs / 60) . 'm ' . ($secs % 60) . 's';
     }
-    $rawTotal  = (int)($run['excel_raw_total']    ?? 0);
-    $dropCount = (int)($run['excel_skipped_load'] ?? 0);
-    $valid     = (int)$run['excel_total'];
-    $dropPct   = $rawTotal > 0 ? round($dropCount / $rawTotal * 100) : 0;
-    $validPct  = 100 - $dropPct;
 
-    $devCards = [
-        ['added',          $run['added'],                        'Added',       '#15803d', '#f0fdf4'],
-        ['updated',        $run['updated'],                      'Updated',     '#2563eb', '#eff6ff'],
-        ['marked_deleted', $run['marked_deleted'],               'Marked Del.', '#d97706', '#fffbeb'],
-        ['skipped',        $run['skipped'],                      'Skipped',     '#64748b', '#f8fafc'],
-        ['failed',         $run['failed'],                       'Failed',      '#dc2626', '#fef2f2'],
-        ['load_skip',      $run['excel_skipped_load'] ?? 0,      'Dropped',     '#f97316', '#fff7ed'],
-        ['empty_site',     $run['empty_sites_marked'] ?? 0,      'Empty Sites',    '#b45309', '#fffbeb'],
-        ['empty_tree',     $run['empty_trees_marked'] ?? 0,      'Empty Branches', '#7c3aed', '#f5f3ff'],
-        ['site_unmarked',  $run['sites_unmarked'] ?? 0,          'Sites Revived',    '#0d9488', '#f0fdfa'],
-        ['tree_unmarked',  $run['trees_unmarked'] ?? 0,          'Branches Revived', '#0d9488', '#f0fdfa'],
+    // [action, run column, label, colour]. Without a column the count is the
+    // number of log entries for the action; without an action the row is not a filter.
+    $sections = [
+        'input' => [__('Inventory File', 'cereus_datasync'), [
+            [null,             'excel_raw_total',    __('Rows in file', 'cereus_datasync'),        '#0f172a'],
+            [null,             'excel_total',        __('Valid rows', 'cereus_datasync'),          '#15803d'],
+            ['load_skip',      'excel_skipped_load', __('Dropped rows', 'cereus_datasync'),        '#ea580c'],
+            [null,             'cacti_total',        __('Devices in Cacti', 'cereus_datasync'),    '#0f172a'],
+        ]],
+        'devices' => [__('Devices', 'cereus_datasync'), [
+            ['added',          'added',              __('Added', 'cereus_datasync'),               '#15803d'],
+            ['updated',        'updated',            __('Updated', 'cereus_datasync'),             '#2563eb'],
+            ['marked_deleted', 'marked_deleted',     __('Marked for deletion', 'cereus_datasync'), '#d97706'],
+            ['skipped',        'skipped',            __('Skipped', 'cereus_datasync'),             '#475569'],
+            ['failed',         'failed',             __('Failed', 'cereus_datasync'),              '#dc2626'],
+        ]],
+        'graphs' => [__('Graphs', 'cereus_datasync'), [
+            [null,             'graphs_found',       __('WAN interfaces found', 'cereus_datasync'), '#0369a1'],
+            ['graph_created',  'graphs_created',     __('Graphs created', 'cereus_datasync'),      '#0891b2'],
+            ['tree_placed',    'tree_placed',        __('Placed on a tree', 'cereus_datasync'),    '#7c3aed'],
+            ['graph_skip',     null,                 __('Graphs skipped', 'cereus_datasync'),      '#475569'],
+            ['graph_error',    null,                 __('Graph errors', 'cereus_datasync'),        '#dc2626'],
+        ]],
+        'rules' => [__('Tree Rules & Branches', 'cereus_datasync'), [
+            ['auto_rule',         null, __('Rules created', 'cereus_datasync'),       '#7c3aed'],
+            ['auto_rule_updated', null, __('Rules updated', 'cereus_datasync'),       '#2563eb'],
+            ['auto_rule_exists',  null, __('Rules already exist', 'cereus_datasync'), '#475569'],
+            ['auto_rule_skip',    null, __('Rules skipped', 'cereus_datasync'),       '#d97706'],
+            ['coreq_ok',          null, __('Co-req groups met', 'cereus_datasync'),   '#0d9488'],
+            ['branch_created',    null, __('Branches created', 'cereus_datasync'),    '#15803d'],
+            ['tree_moved',        null, __('Placements moved', 'cereus_datasync'),    '#9333ea'],
+            ['tree_skip',         null, __('Host rules deferred', 'cereus_datasync'), '#475569'],
+            ['tree_error',        null, __('Tree errors', 'cereus_datasync'),         '#dc2626'],
+        ]],
+        'aggoid' => [__('Aggregate & OID Rules', 'cereus_datasync'), [
+            ['agg_done',  null, __('Aggregates built', 'cereus_datasync'),   '#0891b2'],
+            ['agg_skip',  null, __('Aggregates skipped', 'cereus_datasync'), '#d97706'],
+            ['agg_error', null, __('Aggregate errors', 'cereus_datasync'),   '#dc2626'],
+            ['oid_done',  null, __('OID rules run', 'cereus_datasync'),      '#0891b2'],
+            ['oid_skip',  null, __('OID rules skipped', 'cereus_datasync'),  '#d97706'],
+            ['oid_error', null, __('OID errors', 'cereus_datasync'),         '#dc2626'],
+        ]],
+        'cleanup' => [__('Cleanup', 'cereus_datasync'), [
+            ['empty_site',    'empty_sites_marked', __('Empty sites', 'cereus_datasync'),      '#b45309'],
+            ['empty_tree',    'empty_trees_marked', __('Empty branches', 'cereus_datasync'),   '#7c3aed'],
+            ['site_unmarked', 'sites_unmarked',     __('Sites revived', 'cereus_datasync'),    '#0d9488'],
+            ['tree_unmarked', 'trees_unmarked',     __('Branches revived', 'cereus_datasync'), '#0d9488'],
+        ]],
     ];
-    $graphCards = [
-        ['graph_created',  $run['graphs_created'] ?? 0, 'Graphs Created', '#0891b2', '#ecfeff'],
-        ['tree_placed',    $run['tree_placed'],          'Tree Placed',    '#7c3aed', '#f5f3ff'],
-    ];
+
+    // The spark charts compare this run with the profile's earlier runs of the
+    // same kind (sync, dry run or Apply Rules), oldest first.
+    $history = cereus_datasync_log_history($run);
+
+    // Anything logged that no row covers still gets one.
+    $known = [];
+    foreach ($sections as [, $rowsDef]) {
+        foreach ($rowsDef as $r) {
+            $known[] = $r[0];
+        }
+    }
+    $other = [];
+    foreach (array_diff(array_keys($history['details'][$runId] ?? []), $known) as $extra) {
+        $other[] = [$extra, null, $extra, '#475569'];
+    }
+    if (!empty($other)) {
+        $sections['other'] = [__('Other Events', 'cereus_datasync'), $other];
+    }
 
     html_start_box('', '100%', '', '3', 'center', '');
 
@@ -200,7 +249,7 @@ function cereus_datasync_log_detail(int $runId): void {
     // Run meta bar
     $statusColors = ['completed' => '#15803d', 'failed' => '#dc2626', 'running' => '#2563eb', 'queued' => '#64748b'];
     $sc = $statusColors[$run['status']] ?? '#64748b';
-    print '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:10px 14px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;margin-bottom:16px;font-size:13px;">';
+    print '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:10px 14px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;margin-bottom:10px;font-size:13px;">';
     print '<strong style="font-size:14px;">' . html_escape($run['profile_name']) . '</strong>';
     print '<span style="color:#64748b;">' . html_escape($run['started_at']) . '</span>';
     print '<span style="padding:2px 10px;border-radius:12px;background:' . $sc . ';color:#fff;font-size:12px;font-weight:600;">' . strtoupper($run['status']) . ($run['dry_run'] ? ' · DRY' : '') . '</span>';
@@ -216,7 +265,7 @@ function cereus_datasync_log_detail(int $runId): void {
              WHERE run_id = ? AND action = 'added_dry' AND details LIKE 'dry-run — interface check not run%'",
             [$runId]
         );
-        print '<div style="padding:8px 14px;margin:-6px 0 16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#7c2d12;">';
+        print '<div style="padding:8px 14px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#7c2d12;margin-bottom:10px;">';
         print __('Dry run: nothing was changed. The counts show what a real run would do.', 'cereus_datasync');
         if ($unchecked > 0) {
             print ' ' . __('%d of the devices counted as added still need the SNMP interface check, which dry runs skip — a real run adds them only if an interface matches.', $unchecked, 'cereus_datasync');
@@ -224,94 +273,7 @@ function cereus_datasync_log_detail(int $runId): void {
         print '</div>';
     }
 
-    // Three-column dashboard grid
-    print '<div style="display:grid;grid-template-columns:220px 1fr 180px;gap:16px;align-items:start;">';
-
-    // ── Column 1: Excel input ─────────────────────────────────────────────
-    print '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;">';
-    print '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:10px;">&#128196; Excel Input</div>';
-    if ($rawTotal > 0) {
-        print '<div style="font-size:32px;font-weight:800;color:#0f172a;line-height:1;">' . $rawTotal . '</div>';
-        print '<div style="font-size:12px;color:#64748b;margin-bottom:8px;">raw rows in file</div>';
-        // Progress bar: valid (green) vs dropped (orange)
-        print '<div style="height:8px;border-radius:4px;background:#f1f5f9;overflow:hidden;margin-bottom:6px;">';
-        print '<div style="width:' . $validPct . '%;height:100%;background:#15803d;border-radius:4px;display:inline-block;"></div>';
-        print '<div style="width:' . $dropPct . '%;height:100%;background:#f97316;border-radius:4px;display:inline-block;"></div>';
-        print '</div>';
-        print '<div style="display:flex;gap:8px;font-size:11px;">';
-        print '<span><span style="color:#15803d;font-weight:700;">' . $valid . '</span> valid</span>';
-        if ($dropCount > 0) {
-            print '<span><a href="cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($actionFilter === 'load_skip' ? '' : 'load_skip') . '" style="color:#f97316;font-weight:700;text-decoration:none;">' . $dropCount . ' dropped &#8250;</a></span>';
-        }
-        print '</div>';
-    } else {
-        print '<div style="font-size:32px;font-weight:800;color:#0f172a;line-height:1;">' . $valid . '</div>';
-        print '<div style="font-size:12px;color:#64748b;">devices loaded</div>';
-    }
-    print '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #f1f5f9;font-size:12px;color:#64748b;">';
-    print '<span style="font-weight:600;color:#0f172a;">' . $run['cacti_total'] . '</span> devices in Cacti';
-    print '</div>';
-    print '</div>';
-
-    // ── Column 2: Device results (clickable cards) ────────────────────────
-    print '<div>';
-    print '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:10px;">&#128290; Device Results</div>';
-    print '<div style="display:flex;flex-wrap:wrap;gap:8px;">';
-    foreach ($devCards as [$key, $val, $label, $color, $bg]) {
-        $active = ($actionFilter === $key);
-        $detailCount = (int)db_fetch_cell_prepared(
-            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action IN (?, ?)",
-            [$runId, $key, $key . '_dry']
-        );
-        $href = 'cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($active ? '' : $key);
-        $cardBg    = $active ? $color : $bg;
-        $cardColor = $active ? '#fff' : '#0f172a';
-        $labelClr  = $active ? 'rgba(255,255,255,.8)' : '#64748b';
-        print '<a href="' . $href . '" style="text-decoration:none;flex:0 0 auto;">';
-        print '<div style="min-width:90px;padding:10px 14px;border-radius:8px;background:' . $cardBg . ';border:2px solid ' . $color . ';text-align:center;transition:box-shadow .15s;">';
-        print '<div style="font-size:28px;font-weight:800;color:' . $cardColor . ';line-height:1;">' . $val . '</div>';
-        print '<div style="font-size:11px;color:' . $labelClr . ';margin-top:2px;white-space:nowrap;">' . $label . '</div>';
-        if ($detailCount > 0) {
-            print '<div style="font-size:10px;color:' . $labelClr . ';margin-top:1px;opacity:.7;">' . $detailCount . ' entries</div>';
-        }
-        print '</div></a>';
-    }
-    print '</div>';
-    print '</div>';
-
-    // ── Column 3: Graph results ───────────────────────────────────────────
-    print '<div>';
-    print '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:10px;">&#128200; Graph Results</div>';
-    print '<div style="display:flex;flex-direction:column;gap:8px;">';
-    // Interfaces found (not clickable — no log entries for this)
-    $gFound = (int)($run['graphs_found'] ?? 0);
-    print '<div style="padding:10px 14px;border-radius:8px;background:#f0f9ff;border:1px solid #bae6fd;">';
-    print '<div style="font-size:28px;font-weight:800;color:#0369a1;line-height:1;">' . $gFound . '</div>';
-    print '<div style="font-size:11px;color:#0369a1;margin-top:2px;">WAN interfaces found</div>';
-    print '</div>';
-    foreach ($graphCards as [$key, $val, $label, $color, $bg]) {
-        $active = ($actionFilter === $key);
-        $detailCount = (int)db_fetch_cell_prepared(
-            "SELECT COUNT(*) FROM plugin_cds_run_details WHERE run_id = ? AND action IN (?, ?)",
-            [$runId, $key, $key . '_dry']
-        );
-        $href = 'cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($active ? '' : $key);
-        $cardBg    = $active ? $color : $bg;
-        $cardColor = $active ? '#fff' : '#0f172a';
-        $labelClr  = $active ? 'rgba(255,255,255,.8)' : '#64748b';
-        print '<a href="' . $href . '" style="text-decoration:none;">';
-        print '<div style="padding:10px 14px;border-radius:8px;background:' . $cardBg . ';border:2px solid ' . $color . '">';
-        print '<div style="font-size:28px;font-weight:800;color:' . $cardColor . ';line-height:1;">' . $val . '</div>';
-        print '<div style="font-size:11px;color:' . $labelClr . ';margin-top:2px;">' . $label . '</div>';
-        if ($detailCount > 0) {
-            print '<div style="font-size:10px;color:' . $labelClr . ';opacity:.7;">' . $detailCount . ' entries</div>';
-        }
-        print '</div></a>';
-    }
-    print '</div>';
-    print '</div>';
-
-    print '</div>'; // end grid
+    cereus_datasync_log_stats($runId, $run, $sections, $history, $actionFilter);
 
     // Active filter pill
     if ($actionFilter !== '') {
@@ -344,6 +306,19 @@ function cereus_datasync_log_detail(int $runId): void {
         'graph_error'        => '#dc2626',
         'graph_created'      => '#0891b2',
         'auto_rule'          => '#7c3aed',
+        'auto_rule_updated'  => '#2563eb',
+        'auto_rule_exists'   => '#64748b',
+        'auto_rule_skip'     => '#d97706',
+        'coreq_ok'           => '#0d9488',
+        'branch_created'     => '#15803d',
+        'tree_skip'          => '#94a3b8',
+        'tree_error'         => '#dc2626',
+        'agg_done'           => '#0891b2',
+        'agg_skip'           => '#d97706',
+        'agg_error'          => '#dc2626',
+        'oid_done'           => '#0891b2',
+        'oid_skip'           => '#d97706',
+        'oid_error'          => '#dc2626',
         'tree_placed'        => '#7c3aed',
         'tree_moved'         => '#9333ea',
         'empty_site'         => '#b45309',
@@ -373,7 +348,7 @@ function cereus_datasync_log_detail(int $runId): void {
             form_selectable_cell(html_escape($item['device_ip']), $item['id']);
             print '<td><span style="display:inline-block;padding:2px 8px;border-radius:10px;background:' . $color . ';color:#fff;font-size:11px;">' . html_escape($item['action']) . '</span></td>';
             form_selectable_cell($item['device_id'] ? '<a href="../../host.php?action=edit&id=' . $item['device_id'] . '" class="linkEditMain">' . $item['device_id'] . '</a>' : '—', $item['id']);
-            form_selectable_cell(html_escape($item['details']), $item['id']);
+            form_selectable_cell(html_escape($item['details']), $item['id'], '', 'cds-rpt-details');
             form_end_row();
         }
     } else {
@@ -382,6 +357,224 @@ function cereus_datasync_log_detail(int $runId): void {
 
     html_end_box(false);
     print $nav;
+}
+
+// "2 new · 5 exist · 1 skipped" for the run list; empty when no rule ran.
+function cereus_datasync_log_rule_summary(array $counts): string {
+    $parts = [];
+    foreach ([
+        'auto_rule'         => ['new', '#7c3aed'],
+        'auto_rule_updated' => ['updated', '#2563eb'],
+        'auto_rule_exists'  => ['exist', '#64748b'],
+        'auto_rule_skip'    => ['skipped', '#d97706'],
+        'branch_created'    => ['branches', '#15803d'],
+    ] as $key => [$label, $color]) {
+        if (!empty($counts[$key])) {
+            $parts[] = '<span style="color:' . $color . ';white-space:nowrap;">' . $counts[$key] . ' ' . $label . '</span>';
+        }
+    }
+
+    return implode(' &middot; ', $parts);
+}
+
+// The profile's last runs of the same kind as $run, up to and including it:
+// ['runs' => run rows oldest first, 'details' => run id => action => log entries].
+function cereus_datasync_log_history(array $run, int $limit = 20): array {
+    $rulesOnly = ($run['excel_file'] === '(rules only)');
+
+    $runs = db_fetch_assoc_prepared(
+        'SELECT * FROM plugin_cds_runs
+          WHERE profile_id = ? AND id <= ? AND dry_run = ? AND status = \'completed\'
+            AND ' . ($rulesOnly ? "excel_file = '(rules only)'" : "excel_file <> '(rules only)'") . '
+          ORDER BY id DESC LIMIT ' . $limit,
+        [(int)$run['profile_id'], (int)$run['id'], (int)$run['dry_run']]
+    );
+    $runs = array_reverse(cacti_sizeof($runs) ? $runs : []);
+
+    // The run itself, even when it failed or is still going.
+    if (!cacti_sizeof($runs) || (int)end($runs)['id'] !== (int)$run['id']) {
+        $runs[] = $run;
+    }
+
+    $details = [];
+    $ids     = array_map(function($r) { return (int)$r['id']; }, $runs);
+    $rows    = db_fetch_assoc(
+        'SELECT run_id, action, COUNT(*) AS cnt FROM plugin_cds_run_details
+          WHERE run_id IN (' . implode(',', $ids) . ') GROUP BY run_id, action'
+    );
+    if (cacti_sizeof($rows)) {
+        foreach ($rows as $r) {
+            $key = preg_replace('/_dry$/', '', (string)$r['action']);
+            $details[(int)$r['run_id']][$key] = ($details[(int)$r['run_id']][$key] ?? 0) + (int)$r['cnt'];
+        }
+    }
+
+    return ['runs' => $runs, 'details' => $details];
+}
+
+// The collapsible statistics block: one compact row per counter, with a spark
+// chart of the same counter over the earlier runs. Rows that are 0 now and were
+// 0 in every earlier run are folded away behind "show all".
+function cereus_datasync_log_stats(int $runId, array $run, array $sections, array $history, string $actionFilter): void {
+    $value = function(array $r, ?string $key, ?string $column) use ($history): int {
+        if ($column !== null) return (int)($r[$column] ?? 0);
+
+        return (int)($history['details'][(int)$r['id']][$key] ?? 0);
+    };
+
+    $highlights = [];
+    $hidden     = 0;
+    $html       = '';
+
+    foreach ($sections as $id => [$title, $rowsDef]) {
+        $html .= '<div class="cds-st-sec"><div class="cds-st-title">' . html_escape($title) . '</div>';
+        if ($id === 'rules' && $run['dry_run']) {
+            $html .= '<div class="cds-st-note">' . __('Dry runs do not evaluate rule templates.', 'cereus_datasync') . '</div>';
+        }
+
+        foreach ($rowsDef as [$key, $column, $label, $color]) {
+            $series = [];
+            foreach ($history['runs'] as $r) {
+                $series[] = $value($r, $key, $column);
+            }
+            $now     = (int)end($series);
+            $entries = $key === null ? 0 : (int)($history['details'][$runId][$key] ?? 0);
+            $empty   = !$now && !$entries && !array_sum($series);
+            $active  = ($key !== null && $actionFilter === $key);
+
+            if ($empty) $hidden++;
+            if ($now && $id !== 'input') {
+                // "Rules created" reads "rules created"; "OID errors" stays as it is.
+                $lower        = preg_match('/^[A-Z]{2}/', $label) ? $label : lcfirst($label);
+                $highlights[] = '<span style="color:' . $color . ';">' . $now . '</span> ' . html_escape($lower);
+            }
+
+            $class = 'cds-st-row' . ($now ? '' : ' cds-st-zero') . ($empty ? ' cds-st-empty' : '') . ($active ? ' cds-st-active' : '');
+            $cells = '<span class="cds-st-dot" style="background:' . $color . ';"></span>'
+                . '<span class="cds-st-lbl">' . html_escape($label) . '</span>'
+                . '<span class="cds-st-num">' . $now . '</span>'
+                . cereus_datasync_log_spark($series, $color, $history['runs']);
+
+            if ($key !== null && ($entries || $active)) {
+                $href  = 'cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . ($active ? '' : urlencode($key));
+                $html .= '<a class="' . $class . '" href="' . $href . '" title="' . html_escape($active ? __('Show all events', 'cereus_datasync') : __('Show these %d events', $entries, 'cereus_datasync')) . '">' . $cells . '</a>';
+            } else {
+                $html .= '<div class="' . $class . '">' . $cells . '</div>';
+            }
+        }
+
+        $html .= '</div>';
+    }
+
+    $runCount = cacti_sizeof($history['runs']);
+
+    cereus_datasync_log_report_css();
+
+    print '<details class="cds-st" id="cds-stats" open>';
+    print '<summary><span class="cds-st-caret">&#9656;</span><strong>' . __('Statistics', 'cereus_datasync') . '</strong>';
+    print '<span class="cds-st-sum">' . (cacti_sizeof($highlights) ? implode(' &middot; ', array_slice($highlights, 0, 6)) : __('nothing changed', 'cereus_datasync')) . '</span>';
+    print '<span class="cds-st-hint">' . __('trend: last %d runs of this kind', $runCount, 'cereus_datasync') . '</span>';
+    print '</summary>';
+    print '<div class="cds-st-body">' . $html . '</div>';
+    if ($hidden) {
+        print '<div class="cds-st-foot"><a href="#" id="cds-st-toggle" data-more="' . html_escape(__('Show %d empty counters', $hidden, 'cereus_datasync')) . '" data-less="' . html_escape(__('Hide empty counters', 'cereus_datasync')) . '">' . __('Show %d empty counters', $hidden, 'cereus_datasync') . '</a></div>';
+    }
+    print '</details>';
+    ?>
+    <script>
+    (function() {
+        var box = document.getElementById('cds-stats');
+        var key = 'cds_stats_state';
+        var st  = {};
+        try { st = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (e) {}
+
+        if (st.closed) box.removeAttribute('open');
+        if (st.all) box.classList.add('cds-st-all');
+
+        function save() {
+            try { localStorage.setItem(key, JSON.stringify(st)); } catch (e) {}
+        }
+
+        box.addEventListener('toggle', function() {
+            st.closed = !box.open;
+            save();
+        });
+
+        var t = document.getElementById('cds-st-toggle');
+        function label() {
+            if (t) t.textContent = box.classList.contains('cds-st-all') ? t.getAttribute('data-less') : t.getAttribute('data-more');
+        }
+        label();
+        if (t) t.addEventListener('click', function(e) {
+            e.preventDefault();
+            box.classList.toggle('cds-st-all');
+            st.all = box.classList.contains('cds-st-all');
+            save();
+            label();
+        });
+    })();
+    </script>
+    <?php
+}
+
+// An inline SVG spark chart of $series, with this run (the last point) marked.
+function cereus_datasync_log_spark(array $series, string $color, array $runs): string {
+    $w = 64;
+    $h = 16;
+    $n = count($series);
+    $max = max(1, max($series));
+
+    $title = [];
+    foreach ($runs as $i => $r) {
+        $title[] = substr((string)$r['started_at'], 0, 16) . ': ' . $series[$i];
+    }
+    $title = html_escape(implode("\n", array_slice($title, -8)));
+
+    $pts = [];
+    foreach ($series as $i => $v) {
+        $x = $n > 1 ? round($i * ($w - 4) / ($n - 1) + 2, 1) : $w - 2;
+        $y = round($h - 2 - ($v / $max) * ($h - 4), 1);
+        $pts[] = $x . ',' . $y;
+    }
+    [$lx, $ly] = explode(',', end($pts));
+    $stroke = array_sum($series) ? $color : '#cbd5e1';
+
+    return '<svg class="cds-st-spark" width="' . $w . '" height="' . $h . '" viewBox="0 0 ' . $w . ' ' . $h . '" role="img"><title>' . $title . '</title>'
+        . ($n > 1 ? '<polyline fill="none" stroke="' . $stroke . '" stroke-width="1.3" stroke-linejoin="round" points="' . implode(' ', $pts) . '"/>' : '')
+        . '<circle cx="' . $lx . '" cy="' . $ly . '" r="2" fill="' . $stroke . '"/></svg>';
+}
+
+function cereus_datasync_log_report_css(): void {
+    ?>
+    <style>
+    .cds-st{background:#fff;border:1px solid #e2e8f0;border-radius:8px;margin-top:4px;}
+    .cds-st summary{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:8px 12px;cursor:pointer;list-style:none;font-size:12px;color:#0f172a;user-select:none;}
+    .cds-st summary::-webkit-details-marker{display:none;}
+    .cds-st-caret{display:inline-block;width:10px;color:#64748b;font-size:12px;line-height:1;text-align:center;transition:transform .15s;}
+    .cds-st[open] .cds-st-caret{transform:rotate(90deg);}
+    .cds-st-sum{color:#475569;font-weight:600;}
+    .cds-st-hint{margin-left:auto;color:#94a3b8;font-size:11px;}
+    .cds-st-body{columns:230px;column-gap:20px;padding:4px 12px 8px;border-top:1px solid #f1f5f9;}
+    .cds-st-sec{break-inside:avoid;padding-top:6px;margin-bottom:6px;}
+    .cds-st-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:2px;}
+    .cds-st-note{font-size:10px;color:#94a3b8;margin-bottom:2px;}
+    .cds-st-row{display:flex;align-items:center;gap:6px;height:19px;padding:0 4px;border-radius:4px;font-size:12px;color:#0f172a;text-decoration:none;}
+    a.cds-st-row:hover{background:#f1f5f9;}
+    .cds-st-dot{width:6px;height:6px;border-radius:50%;flex:0 0 6px;}
+    .cds-st-lbl{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .cds-st-num{font-weight:700;min-width:28px;text-align:right;font-variant-numeric:tabular-nums;}
+    .cds-st-spark{flex:0 0 64px;}
+    .cds-st-zero{color:#94a3b8;}
+    .cds-st-zero .cds-st-dot{background:#e2e8f0 !important;}
+    .cds-st-empty{display:none;}
+    .cds-st-all .cds-st-empty{display:flex;}
+    .cds-st-active{background:#0f172a;color:#fff;}
+    a.cds-st-active:hover{background:#1e293b;}
+    .cds-st-foot{padding:0 12px 8px;font-size:11px;}
+    .cds-st-foot a{color:#64748b;}
+    .cds-rpt-details{white-space:normal !important;word-break:break-word;}
+    </style>
+    <?php
 }
 
 // ─── Purge ────────────────────────────────────────────────────────────────────

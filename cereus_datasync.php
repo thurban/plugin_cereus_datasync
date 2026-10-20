@@ -167,6 +167,7 @@ function cereus_datasync_list(): void {
             print '<td style="white-space:nowrap;">';
             print '<a class="cds-btn-run" href="#" data-id="' . $row['id'] . '" data-dry="0" title="' . __('Run Now', 'cereus_datasync') . '">&#9654; Run</a> ';
             print '<a class="cds-btn-run" href="#" data-id="' . $row['id'] . '" data-dry="1" style="color:#7c3aed;" title="' . __('Dry Run', 'cereus_datasync') . '">&#9654; Dry</a> ';
+            print '<a class="cds-btn-run" href="#" data-id="' . $row['id'] . '" data-dry="0" data-rules="1" style="color:#0369a1;" title="' . __('Apply the rules to the devices and graphs already in Cacti, without importing the inventory file', 'cereus_datasync') . '">&#9654; Apply Rules</a> ';
             print '<a href="cereus_datasync_rules.php?profile_id=' . $row['id'] . '" title="' . __('Tree Rules', 'cereus_datasync') . '" class="cds-link">&#127795; Rules</a> ';
             print '<a href="cereus_datasync_log.php?profile_id=' . $row['id'] . '" title="' . __('History', 'cereus_datasync') . '" class="cds-link">&#128203; Log</a> ';
             print '<a href="cereus_datasync.php?action=copy&id=' . $row['id'] . '" title="' . __('Copy Profile', 'cereus_datasync') . '" class="cds-link">&#128260; Copy</a>';
@@ -210,7 +211,8 @@ function cereus_datasync_list(): void {
         var cdsPoller      = null;
         var cdsReloadTimer = null;
 
-        function cdsStatsText(s, status) {
+        function cdsStatsText(s, status, d) {
+            d = d || {};
             var raw   = s.excel_raw_total    || 0;
             var valid = s.excel_total        || 0;
             var drop  = s.excel_skipped_load || 0;
@@ -229,7 +231,13 @@ function cereus_datasync_list(): void {
                 + 'Skipped        : ' + (s.skipped        || 0) + '\n'
                 + 'Failed         : ' + (s.failed         || 0) + '\n'
                 + 'Graphs found   : ' + (s.graphs_found   || 0) + '\n'
-                + 'Graphs created : ' + (s.graphs_created || 0)
+                + 'Graphs created : ' + (s.graphs_created || 0) + '\n'
+                + 'Tree placed    : ' + (s.tree_placed    || 0) + '\n\n'
+                + 'Rules created  : ' + (d.auto_rule         || 0) + '\n'
+                + 'Rules updated  : ' + (d.auto_rule_updated || 0) + '\n'
+                + 'Rules existing : ' + (d.auto_rule_exists  || 0) + '\n'
+                + 'Rules skipped  : ' + (d.auto_rule_skip    || 0) + '\n'
+                + 'Branches new   : ' + (d.branch_created    || 0)
                 + checkLine;
         }
 
@@ -243,7 +251,7 @@ function cereus_datasync_list(): void {
                     return;
                 }
                 var done = (data.status === 'completed' || data.status === 'failed');
-                $('#cds-modal-body').text(cdsStatsText(data.stats || {}, data.status));
+                $('#cds-modal-body').text(cdsStatsText(data.stats || {}, data.status, data.details));
                 if (done) {
                     clearInterval(cdsPoller);
                     cdsPoller = null;
@@ -262,8 +270,9 @@ function cereus_datasync_list(): void {
         $('.cds-btn-run').on('click', function(e) {
             e.preventDefault();
             var pid = $(this).data('id');
-            var dry = $(this).data('dry');
-            $('#cds-modal-title').text(dry ? 'Dry Run — Profile #' + pid : 'Running sync — Profile #' + pid);
+            var dry   = $(this).data('dry');
+            var rules = $(this).data('rules') ? 1 : 0;
+            $('#cds-modal-title').text(dry ? 'Dry Run — Profile #' + pid : (rules ? 'Applying rules — Profile #' + pid : 'Running sync — Profile #' + pid));
             $('#cds-modal-body').text('Queuing run…');
             $('#cds-modal-close').hide();
             $('#cds-modal-spinner').show();
@@ -275,6 +284,7 @@ function cereus_datasync_list(): void {
                 action:     'trigger_run',
                 profile_id: pid,
                 dry_run:    dry,
+                rules_only: rules,
                 __csrf_magic: csrfMagicToken
             }, function(data) {
                 if (data.error) {

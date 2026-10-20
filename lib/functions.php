@@ -47,8 +47,9 @@ function cereus_datasync_copy_profile(int $id): int {
              snmp_parallel_workers, default_snmp_version, default_snmp_community,
              default_snmp_port, default_snmp_timeout, default_availability,
              default_ping_method, default_poller_id, deletion_tag, deletion_skip_localhost,
-             auto_graph_rules, auto_create_graphs, graph_query_type_id)
-         VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             auto_graph_rules, auto_create_graphs, graph_query_type_id,
+             rules_schedule_type, rules_schedule_hour, rules_schedule_wday)
+         VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             $newName,
             $src['description'],
@@ -76,6 +77,9 @@ function cereus_datasync_copy_profile(int $id): int {
             (int)$src['auto_graph_rules'],
             (int)$src['auto_create_graphs'],
             (int)$src['graph_query_type_id'],
+            $src['rules_schedule_type'] ?? 'manual',
+            (int)($src['rules_schedule_hour'] ?? 3),
+            (int)($src['rules_schedule_wday'] ?? 1),
         ]
     );
     $newId = (int)db_fetch_insert_id();
@@ -321,9 +325,11 @@ function cereus_datasync_truncate_title(string $title): string {
 
 /**
  * Find one header node under $parentId, creating it when it is not there yet.
- * Returns its graph_tree_items.id, or 0 if the insert failed.
+ * Returns its graph_tree_items.id, or 0 if the insert failed.  $created is set
+ * to true only when the header was inserted by this call.
  */
-function cereus_datasync_find_or_create_branch(int $treeId, int $parentId, string $title, string $deletionTag = ''): int {
+function cereus_datasync_find_or_create_branch(int $treeId, int $parentId, string $title, string $deletionTag = '', ?bool &$created = null): int {
+    $created = false;
     if ($title === '') return $parentId;
 
     $id = (int)db_fetch_cell_prepared(
@@ -359,7 +365,10 @@ function cereus_datasync_find_or_create_branch(int $treeId, int $parentId, strin
         [$treeId, $title, $parentId]
     );
 
-    return (int)db_fetch_insert_id();
+    $id      = (int)db_fetch_insert_id();
+    $created = $id > 0;
+
+    return $id;
 }
 
 /**
@@ -367,14 +376,17 @@ function cereus_datasync_find_or_create_branch(int $treeId, int $parentId, strin
  * the way that does not exist yet.  An empty path means the tree root, which is
  * what 0 denotes to Cacti; 0 also comes back when a segment could not be
  * created, so the caller places at the root rather than losing the item.
+ * $created collects the titles of the headers this call inserted.
  */
-function cereus_datasync_resolve_branch_path(int $treeId, string $path, string $deletionTag = ''): int {
+function cereus_datasync_resolve_branch_path(int $treeId, string $path, string $deletionTag = '', ?array &$created = null): int {
+    $created = [];
     if (!$treeId) return 0;
 
     $parentId = 0;
     foreach (cereus_datasync_split_branch_path($path) as $title) {
-        $parentId = cereus_datasync_find_or_create_branch($treeId, $parentId, $title, $deletionTag);
+        $parentId = cereus_datasync_find_or_create_branch($treeId, $parentId, $title, $deletionTag, $new);
         if (!$parentId) break;
+        if ($new) $created[] = $title;
     }
 
     return $parentId;
@@ -648,3 +660,20 @@ function cereus_datasync_fail_stale_runs(): void {
         AND started_at < NOW() - INTERVAL 12 HOUR");
 }
 
+// Log entries of a run per action; a dry run's "<action>_dry" counts as <action>.
+function cereus_datasync_run_action_counts(int $runId): array {
+    $rows = db_fetch_assoc_prepared(
+        'SELECT action, COUNT(*) AS cnt FROM plugin_cds_run_details WHERE run_id = ? GROUP BY action',
+        [$runId]
+    );
+
+    $counts = [];
+    if (cacti_sizeof($rows)) {
+        foreach ($rows as $r) {
+            $key = preg_replace('/_dry$/', '', (string)$r['action']);
+            $counts[$key] = ($counts[$key] ?? 0) + (int)$r['cnt'];
+        }
+    }
+
+    return $counts;
+}

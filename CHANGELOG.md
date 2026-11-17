@@ -5,6 +5,31 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-11-03
+
+### Added
+- **SNMP naming checks.** The single *Interface Pattern*, which only looked at
+  `ifAlias`, is now a list of entries per profile: any SNMP data (`ifAlias`,
+  `ifDescr`, `ifName`, Cisco IP SLA tag or any numeric OID) with its own text match.
+  A device passes when any entry matches, and the run log names the entry. Each
+  entry can create graphs for the rows it matches, replacing the profile's single
+  *Data Query / Graph Template*. The upgrade turns each profile's existing pattern
+  and graph type into its first entry.
+  Each entry applies to all device functions or only the ones you choose, for both
+  the check and its graphs.
+- **Graph title prefix.** A new *Graph Title Prefix* profile setting puts text in
+  front of the title of every graph the profile creates: naming check graphs, OID
+  rule graphs and aggregate graphs. Existing graphs keep their title, except
+  aggregate graphs, whose title is rebuilt on every run.
+
+### Changed
+- **Check graphs for existing devices.** Existing devices were only walked for
+  check graphs when they had no graph at all, so a check added later (e.g. IP SLA)
+  never reached them. They are now walked per check, for each check they have no
+  graph of yet, on sync runs and on *Apply Rules* runs.
+- Naming checks use the profile's SNMP port; the parallel worker always used 161.
+- `INFO` homepage is now https://www.urban-software.com.
+
 ## [1.9.0] - 2026-10-20
 
 ### Added

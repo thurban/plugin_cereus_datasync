@@ -220,7 +220,7 @@ function cereus_datasync_list(): void {
                 ? 'Excel rows     : ' + raw + ' raw → ' + valid + ' valid (' + drop + ' dropped)'
                 : 'Excel devices  : ' + valid;
             var checkLine = (s.checking || 0) > 0
-                ? '\nChecking L2    : ' + s.checking + ' devices pending SNMP WAN check…'
+                ? '\nChecking L2    : ' + s.checking + ' devices pending SNMP check…'
                 : '';
             return 'Status         : ' + status + '\n\n'
                 + excelLine + '\n'

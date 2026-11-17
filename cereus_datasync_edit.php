@@ -4,6 +4,7 @@ chdir('../../');
 require('./include/auth.php');
 require_once(__DIR__ . '/lib/license_check.php');
 require_once(__DIR__ . '/lib/functions.php');
+require_once(__DIR__ . '/lib/snmp_checks.php');
 
 if (!api_user_realm_auth('cereus_datasync.php')) {
     header('Location: ../../index.php');
@@ -68,7 +69,6 @@ function cereus_datasync_save(): void {
         'rules_schedule_hour'   => (int)get_nfilter_request_var('rules_schedule_hour', 3),
         'rules_schedule_wday'   => (int)get_nfilter_request_var('rules_schedule_wday', 1),
         'snmp_check_l2'         => isset($_POST['snmp_check_l2']) ? 1 : 0,
-        'snmp_wan_pattern'      => trim(get_nfilter_request_var('snmp_wan_pattern', '-WAN-')) ?: '-WAN-',
         'snmp_timeout_ms'       => max(500, (int)get_nfilter_request_var('snmp_timeout_ms', 2000)),
         'snmp_enable_parallel'  => isset($_POST['snmp_enable_parallel']) ? 1 : 0,
         'snmp_parallel_workers' => max(1, min(100, (int)get_nfilter_request_var('snmp_parallel_workers', 20))),
@@ -84,7 +84,8 @@ function cereus_datasync_save(): void {
         'mark_empty_sites'      => isset($_POST['mark_empty_sites']) ? 1 : 0,
         'mark_empty_tree_items' => isset($_POST['mark_empty_tree_items']) ? 1 : 0,
         'auto_create_graphs'    => isset($_POST['auto_create_graphs']) ? 1 : 0,
-        'graph_query_type_id'   => (int)get_nfilter_request_var('graph_query_type_id', 0),
+        // Only the left side is trimmed: a trailing space or dash separates the prefix from the title.
+        'graph_title_prefix'    => substr(ltrim(get_nfilter_request_var('graph_title_prefix', '')), 0, 64),
         'auto_graph_rules'      => isset($_POST['auto_graph_rules']) ? 1 : 0,
     ];
 
@@ -111,6 +112,7 @@ function cereus_datasync_save(): void {
         $phs  = implode(', ', array_fill(0, count($data), '?'));
         db_execute_prepared("INSERT INTO plugin_cds_profiles ($cols) VALUES ($phs)", array_values($data));
         $id = (int)db_fetch_insert_id();
+        cereus_datasync_snmp_check_add($id, 'WAN interfaces', '.1.3.6.1.2.1.31.1.1.1.18', '-WAN-');
     }
 
     // Save column maps
@@ -144,7 +146,7 @@ function cereus_datasync_edit_form(int $id): void {
         'sheet_name' => 'Sheet1', 'data_start_row' => 4,
         'schedule_type' => 'manual', 'schedule_hour' => 2, 'schedule_wday' => 1,
         'rules_schedule_type' => 'manual', 'rules_schedule_hour' => 3, 'rules_schedule_wday' => 1,
-        'snmp_check_l2' => 1, 'snmp_wan_pattern' => '-WAN-', 'snmp_timeout_ms' => 2000,
+        'snmp_check_l2' => 1, 'snmp_timeout_ms' => 2000,
         'snmp_enable_parallel' => 0, 'snmp_parallel_workers' => 20,
         'default_snmp_version' => 2, 'default_snmp_community' => 'public',
         'default_snmp_port' => 161, 'default_snmp_timeout' => 500,
@@ -152,7 +154,7 @@ function cereus_datasync_edit_form(int $id): void {
         'default_poller_id' => 1,
         'deletion_tag' => '[TO BE DELETED]', 'deletion_skip_localhost' => 1,
         'mark_empty_sites' => 1, 'mark_empty_tree_items' => 1,
-        'auto_create_graphs' => 0, 'graph_query_type_id' => 0, 'auto_graph_rules' => 0,
+        'auto_create_graphs' => 0, 'graph_title_prefix' => '', 'auto_graph_rules' => 0,
     ];
     $r = array_merge($defaults, $row ?: []);
 
@@ -254,7 +256,7 @@ function cereus_datasync_edit_form(int $id): void {
     print '<tr style="background:#f1f5f9;">';
     print '<th style="padding:8px 10px;width:38%;">' . __('Device Function', 'cereus_datasync') . '</th>';
     print '<th style="padding:8px 10px;">' . __('Host Template', 'cereus_datasync') . '</th>';
-    print '<th style="padding:8px 10px;width:110px;text-align:center;" title="' . __('Run SNMP interface name check before adding. Devices with no matching interface are skipped.', 'cereus_datasync') . '">' . __('Interface Check', 'cereus_datasync') . '</th>';
+    print '<th style="padding:8px 10px;width:110px;text-align:center;" title="' . __('Run the SNMP naming checks that apply to this device function before adding. Devices that pass none of them are skipped.', 'cereus_datasync') . '">' . __('SNMP Check', 'cereus_datasync') . '</th>';
     print '<th style="width:50px;padding:8px 10px;"></th></tr>';
 
     if (cacti_sizeof($funcMaps)) {
@@ -273,29 +275,44 @@ function cereus_datasync_edit_form(int $id): void {
     print '</td></tr>';
     html_end_box();
 
+    // ── SNMP Naming Checks ────────────────────────────────────────────────
+    html_start_box(__('SNMP Naming Checks', 'cereus_datasync'), '100%', '', '3', 'center', '');
+    print '<tr class="even"><td style="padding:10px 15px;">';
+    print '<p style="margin:0 0 6px;font-size:12px;color:#666;">' . __('Each entry names SNMP data to walk and the text to look for, for all device functions or only the ones you choose. A device whose function has SNMP Check ticked is added when any enabled entry for that function matches; with no complete entry for it, the device is skipped. Choosing a graph type creates a graph for each matching row when Auto-create Graphs is on; the type must be a data query whose index is the number after the OID.', 'cereus_datasync') . '</p>';
+    if ($id) {
+        $queryTypes = cereus_datasync_query_type_options();
+        print '<div id="cds-check-list">';
+        $checks = db_fetch_assoc_prepared('SELECT * FROM plugin_cds_snmp_checks WHERE profile_id = ? ORDER BY id', [$id]);
+        if (cacti_sizeof($checks)) {
+            foreach ($checks as $check) {
+                print cereus_datasync_render_snmp_check_row($check, $queryTypes, $funcMaps);
+            }
+        }
+        print '</div>';
+        print '<div style="margin-top:8px;"><button type="button" class="ui-button" id="cds-add-check">+ ' . __('Add Check', 'cereus_datasync') . '</button></div>';
+    } else {
+        print '<p style="color:#666;font-size:12px;margin-top:8px;font-style:italic;">' . __('A new profile starts with a check for -WAN- in ifAlias. Save the profile to change it or add more.', 'cereus_datasync') . '</p>';
+    }
+    print '</td></tr>';
+    html_end_box();
+
     // ── SNMP & Performance ────────────────────────────────────────────────
     html_start_box(__('SNMP & Device Defaults', 'cereus_datasync'), '100%', '', '3', 'center', '');
     draw_edit_form(['config' => ['no_form_tag' => true], 'fields' => [
         'snmp_check_l2' => [
-            'friendly_name' => __('Enable Interface Naming Checks', 'cereus_datasync'),
-            'description'   => __('Before adding a device, SNMP-walk its ifAlias OIDs and check whether any interface name matches the pattern below. Devices with no matching interface are skipped.', 'cereus_datasync'),
+            'friendly_name' => __('Enable SNMP Naming Checks', 'cereus_datasync'),
+            'description'   => __('Before adding a device whose function has SNMP Check ticked, walk the SNMP Naming Checks above that apply to that function. Devices that pass none of them are skipped.', 'cereus_datasync'),
             'method'        => 'checkbox', 'value' => $r['snmp_check_l2'] ? 'on' : '',
-        ],
-        'snmp_wan_pattern' => [
-            'friendly_name' => __('Interface Pattern', 'cereus_datasync'),
-            'description'   => __('Substring matched (case-insensitive) against each interface\'s ifAlias. Devices with no matching interface are skipped.', 'cereus_datasync'),
-            'method'        => 'textbox', 'max_length' => 64, 'size' => 20,
-            'value'         => $r['snmp_wan_pattern'],
         ],
         'snmp_timeout_ms' => [
             'friendly_name' => __('SNMP Timeout (ms)', 'cereus_datasync'),
-            'description'   => __('SNMP timeout in milliseconds for WAN interface checks.', 'cereus_datasync'),
+            'description'   => __('SNMP timeout in milliseconds for naming checks.', 'cereus_datasync'),
             'method'        => 'textbox', 'max_length' => 6, 'size' => 8,
             'value'         => $r['snmp_timeout_ms'],
         ],
         'snmp_enable_parallel' => [
             'friendly_name' => __('Parallel SNMP Checks', 'cereus_datasync'),
-            'description'   => __('Run interface checks concurrently using multiple worker processes. Significantly faster for large device lists.', 'cereus_datasync'),
+            'description'   => __('Run naming checks concurrently using multiple worker processes. Significantly faster for large device lists.', 'cereus_datasync'),
             'method'        => 'checkbox', 'value' => $r['snmp_enable_parallel'] ? 'on' : '',
         ],
         'snmp_parallel_workers' => [
@@ -441,36 +458,24 @@ function cereus_datasync_edit_form(int $id): void {
 
     // ── Graph Creation & Automation Rules ────────────────────────────────
     // Build query type dropdown: "SNMP - Interface Statistics — In/Out Bits"
-    $queryTypeRows = db_fetch_assoc(
-        'SELECT sqg.id, CONCAT(sq.name, " — ", sqg.name) AS label
-         FROM snmp_query_graph sqg
-         JOIN snmp_query sq ON sq.id = sqg.snmp_query_id
-         ORDER BY sq.name, sqg.name'
-    );
-    $queryTypeArr = [0 => __('-- Select Data Query / Graph Type --', 'cereus_datasync')];
-    if (cacti_sizeof($queryTypeRows)) {
-        foreach ($queryTypeRows as $qt) {
-            $queryTypeArr[(int)$qt['id']] = html_escape($qt['label']);
-        }
-    }
-
     html_start_box(__('Graph Creation & Tree Automation', 'cereus_datasync'), '100%', '', '3', 'center', '');
     print '<tr><td colspan="2" style="padding:6px 15px;background:#f0f9ff;border-bottom:1px solid #bae6fd;font-size:12px;color:#0369a1;">';
-    print __('When a new device is added, the sync can immediately create graphs for its WAN interfaces. It walks the device via SNMP, finds interfaces whose <strong>ifAlias</strong> matches the Interface pattern above, then creates a graph per interface using the selected template. Cacti\'s automation rules (configured on the Rules page) then fire automatically to place those graphs in the correct tree leaf.', 'cereus_datasync');
+    print __('When a new device is added, the sync can immediately create graphs from the SNMP Naming Checks above: one graph per matching row, for each entry with a graph type that applies to its device function. Cacti\'s automation rules (configured on the Rules page) then fire automatically to place those graphs in the correct tree leaf.', 'cereus_datasync');
     print '</td></tr>';
     draw_edit_form(['config' => ['no_form_tag' => true], 'fields' => [
         'auto_create_graphs' => [
-            'friendly_name' => __('Auto-create WAN Graphs', 'cereus_datasync'),
-            'description'   => __('After a device is added, SNMP-walk it, find WAN interfaces (by ifAlias pattern), and create a graph for each using the selected Data Query and Graph Template below.', 'cereus_datasync'),
+            'friendly_name' => __('Auto-create Graphs', 'cereus_datasync'),
+            'description'   => __('After a device is added, create a graph for each row matched by an SNMP Naming Check that applies to its device function and has a graph type.', 'cereus_datasync'),
             'method'        => 'checkbox',
             'value'         => !empty($r['auto_create_graphs']) ? 'on' : '',
         ],
-        'graph_query_type_id' => [
-            'friendly_name' => __('Data Query / Graph Template', 'cereus_datasync'),
-            'description'   => __('The Data Query and Graph Template combination to use when creating WAN interface graphs. e.g. "SNMP - Interface Statistics — In/Out Bits".', 'cereus_datasync'),
-            'method'        => 'drop_array',
-            'array'         => $queryTypeArr,
-            'value'         => (int)($r['graph_query_type_id'] ?? 0),
+        'graph_title_prefix' => [
+            'friendly_name' => __('Graph Title Prefix', 'cereus_datasync'),
+            'description'   => __('Text put in front of the title of every graph this profile creates: naming check graphs, OID rule graphs and aggregate graphs. Include your own separator, e.g. "NET - ". Existing graphs keep their title, except aggregate graphs, whose title is rebuilt on every run.', 'cereus_datasync'),
+            'method'        => 'textbox',
+            'value'         => $r['graph_title_prefix'] ?? '',
+            'max_length'    => 64,
+            'size'          => 40,
         ],
         'sp_autorules' => ['method' => 'spacer', 'friendly_name' => __('Tree Automation Rules', 'cereus_datasync')],
         'auto_graph_rules' => [
@@ -524,6 +529,7 @@ function cereus_datasync_edit_form(int $id): void {
                     if (data.id) {
                         var html = buildFuncRow(data.id, '', 0, 0);
                         $('#cds-func-table').append(html);
+                        cdsSyncCheckFunction(data.id, '');
                     }
                 }, 'json');
             });
@@ -538,7 +544,72 @@ function cereus_datasync_edit_form(int $id): void {
                     __csrf_magic: csrfMagicToken
                 }, function() {
                     btn.closest('tr').remove();
+                    $('.cds-check-func[data-map="' + mid + '"]').remove();
+                    $('.cds-check-row').each(function() { cdsShowCheckScope($(this)); });
                 }, 'json');
+            });
+
+            cdsLimitCheckMenus($('#cds-check-list'));
+
+            $('#cds-add-check').on('click', function() {
+                $.post('cereus_datasync_ajax.php', {
+                    action: 'add_snmp_check',
+                    profile_id: cdsProfileId,
+                    __csrf_magic: csrfMagicToken
+                }, function(data) {
+                    if (data.html) {
+                        var row = $(data.html).appendTo('#cds-check-list');
+                        row.find('select').selectmenu({
+                            change: function() { $(this).trigger('change'); }
+                        });
+                        cdsLimitCheckMenus(row);
+                        row.find('.cds-check-pattern').trigger('focus');
+                    }
+                }, 'json');
+            });
+
+            $(document).on('click', '.cds-check-del', function() {
+                var row = $(this).closest('.cds-check-row');
+                $.post('cereus_datasync_ajax.php', {
+                    action: 'delete_snmp_check',
+                    check_id: row.data('id'),
+                    profile_id: cdsProfileId,
+                    __csrf_magic: csrfMagicToken
+                }, function() {
+                    row.remove();
+                }, 'json');
+            });
+
+            // These inputs have no name, so Enter must not submit the profile form.
+            $(document).on('keydown', '.cds-check-row input[type=text]', function(event) {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    $(this).trigger('blur');
+                }
+            });
+
+            $(document).on('change', '.cds-check-preset', function() {
+                var row = $(this).closest('.cds-check-row');
+                if ($(this).val() !== '') {
+                    row.find('.cds-check-oid').val($(this).val());
+                }
+            });
+
+            $(document).on('change', '.cds-check-row input, .cds-check-row select', function() {
+                var row = $(this).closest('.cds-check-row');
+                var oid = row.find('.cds-check-oid').val();
+
+                cdsShowCheckScope(row);
+
+                if ($(this).hasClass('cds-check-oid')) {
+                    var preset = row.find('.cds-check-preset');
+                    preset.val(preset.find('option[value="' + CSS.escape(oid.trim()) + '"]').length ? oid.trim() : '');
+                    if (preset.selectmenu('instance')) {
+                        preset.selectmenu('refresh');
+                    }
+                }
+
+                cdsSaveCheck(row);
             });
 
             $(document).on('blur change', '.cds-func-name, .cds-func-tpl, .cds-func-snmp', function() {
@@ -553,8 +624,77 @@ function cereus_datasync_edit_form(int $id): void {
                     snmp_check: row.find('.cds-func-snmp').is(':checked') ? 1 : 0,
                     __csrf_magic: csrfMagicToken
                 }, null, 'json');
+                cdsSyncCheckFunction(mid, row.find('.cds-func-name').val());
             });
         });
+
+        // A long list, such as all graph types, opens beyond the top of the page,
+        // which cannot scroll to it. Keep it short enough to scroll by itself.
+        // jQuery UI ignores a pointer that did not move, so after scrolling with the
+        // wheel a click would pick the item that was under it before: focus it first.
+        function cdsLimitCheckMenus(scope) {
+            scope.find('select').each(function() {
+                if ($(this).selectmenu('instance')) {
+                    var menu = $(this).selectmenu('menuWidget');
+                    menu.css('max-height', '300px').on('mousedown', '.ui-menu-item', function(event) {
+                        menu.menu('focus', event, $(this));
+                    });
+                }
+            });
+        }
+
+        // One save per entry at a time, so ticking several functions quickly cannot
+        // let an older save land last and lose a tick.
+        function cdsSaveCheck(row) {
+            if (row.data('saving')) {
+                row.data('dirty', true);
+                return;
+            }
+            row.data('saving', true);
+
+            var status = row.find('.cds-check-status');
+            $.post('cereus_datasync_ajax.php', {
+                action: 'update_snmp_check',
+                check_id: row.data('id'),
+                profile_id: cdsProfileId,
+                enabled: row.find('.cds-check-on').is(':checked') ? 'on' : '',
+                name: row.find('.cds-check-name').val(),
+                oid: row.find('.cds-check-oid').val(),
+                operator: row.find('.cds-check-operator').val(),
+                pattern: row.find('.cds-check-pattern').val(),
+                graph_query_type_id: row.find('.cds-check-graph').val(),
+                all_functions: row.find('.cds-check-all').is(':checked') ? 1 : 0,
+                functions: row.find('.cds-check-func-list input:checked').map(function() { return this.value; }).get().join(','),
+                __csrf_magic: csrfMagicToken
+            }, function(data) {
+                status.toggleClass('cds-check-error', !!data.error).text(data.error || '');
+            }, 'json').always(function() {
+                row.data('saving', false);
+                if (row.data('dirty')) {
+                    row.data('dirty', false);
+                    cdsSaveCheck(row);
+                }
+            });
+        }
+
+        function cdsShowCheckScope(row) {
+            var all = row.find('.cds-check-all').is(':checked');
+            row.find('.cds-check-func-list').toggle(!all);
+            row.find('.cds-check-none').toggle(!all && !row.find('.cds-check-func-list input:checked').length);
+        }
+
+        // Keep the entries' function lists in step with the mapping table above.
+        function cdsSyncCheckFunction(id, name) {
+            $('.cds-check-func-list').each(function() {
+                var item = $(this).find('.cds-check-func[data-map="' + id + '"]');
+                if (!item.length) {
+                    item = $('<label class="cds-check-func"><input type="checkbox"> <span></span></label>').attr('data-map', id).appendTo(this);
+                    item.find('input').val(id);
+                }
+                item.find('span').text(name);
+                item.toggle(name !== '');
+            });
+        }
 
         function buildFuncRow(id, fn, tplId, snmpCheck) {
             var rowCount = $('#cds-func-table tr[data-id]').length;
@@ -565,7 +705,7 @@ function cereus_datasync_edit_form(int $id): void {
             return '<tr data-id="' + id + '" class="' + rowClass + '">'
                 + '<td style="padding:5px 10px;"><input type="text" class="cds-func-name ui-state-default ui-corner-all" value="' + $('<div>').text(fn).html() + '" style="width:100%;" placeholder="e.g. Router"></td>'
                 + '<td style="padding:5px 10px;"><select class="cds-func-tpl ui-state-default ui-corner-all" style="width:100%;">' + opts + '</select></td>'
-                + '<td style="padding:5px 10px;text-align:center;"><input type="checkbox" class="cds-func-snmp"' + (snmpCheck ? ' checked' : '') + ' title="Run interface name check for this device type"></td>'
+                + '<td style="padding:5px 10px;text-align:center;"><input type="checkbox" class="cds-func-snmp"' + (snmpCheck ? ' checked' : '') + ' title="Run the SNMP naming checks that apply to this device function"></td>'
                 + '<td style="padding:5px 10px;text-align:center;"><button type="button" class="ui-button cds-del-func" data-id="' + id + '" style="min-width:0;padding:2px 8px;">&#128465;</button></td>'
                 + '</tr>';
         }
@@ -588,7 +728,7 @@ function cereus_datasync_render_funcmap_row(int $id, string $func, int $tplId, i
         print '<option value="' . $tid . '"' . ($tid == $tplId ? ' selected' : '') . '>' . html_escape($tname) . '</option>';
     }
     print '</select></td>';
-    print '<td style="padding:5px 10px;text-align:center;" title="' . __('Run SNMP interface name check for this device type before adding', 'cereus_datasync') . '">';
+    print '<td style="padding:5px 10px;text-align:center;" title="' . __('Run the SNMP naming checks that apply to this device function before adding', 'cereus_datasync') . '">';
     print '<input type="checkbox" class="cds-func-snmp"' . ($snmpCheck ? ' checked' : '') . '>';
     print '</td>';
     print '<td style="padding:5px 10px;text-align:center;"><button type="button" class="ui-button cds-del-func" data-id="' . $id . '" style="min-width:0;padding:2px 8px;">&#128465;</button></td>';

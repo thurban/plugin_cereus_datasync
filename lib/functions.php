@@ -23,6 +23,13 @@ function cereus_datasync_delete_profile(int $id): void {
     db_execute_prepared('DELETE FROM plugin_cds_tree_rules WHERE profile_id = ?', [$id]);
     db_execute_prepared('DELETE FROM plugin_cds_aggregate_rules WHERE profile_id = ?', [$id]);
     db_execute_prepared('DELETE FROM plugin_cds_oid_rules WHERE profile_id = ?', [$id]);
+    db_execute_prepared(
+        'DELETE l FROM plugin_cds_snmp_check_functions AS l
+         JOIN plugin_cds_snmp_checks AS c ON c.id = l.check_id
+         WHERE c.profile_id = ?',
+        [$id]
+    );
+    db_execute_prepared('DELETE FROM plugin_cds_snmp_checks WHERE profile_id = ?', [$id]);
     db_execute_prepared('DELETE FROM plugin_cds_function_maps WHERE profile_id = ?', [$id]);
     db_execute_prepared('DELETE FROM plugin_cds_column_maps WHERE profile_id = ?', [$id]);
     db_execute_prepared('DELETE FROM plugin_cds_profiles WHERE id = ?', [$id]);
@@ -47,9 +54,9 @@ function cereus_datasync_copy_profile(int $id): int {
              snmp_parallel_workers, default_snmp_version, default_snmp_community,
              default_snmp_port, default_snmp_timeout, default_availability,
              default_ping_method, default_poller_id, deletion_tag, deletion_skip_localhost,
-             auto_graph_rules, auto_create_graphs, graph_query_type_id,
+             auto_graph_rules, auto_create_graphs, graph_query_type_id, graph_title_prefix,
              rules_schedule_type, rules_schedule_hour, rules_schedule_wday)
-         VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             $newName,
             $src['description'],
@@ -77,6 +84,7 @@ function cereus_datasync_copy_profile(int $id): int {
             (int)$src['auto_graph_rules'],
             (int)$src['auto_create_graphs'],
             (int)$src['graph_query_type_id'],
+            $src['graph_title_prefix'],
             $src['rules_schedule_type'] ?? 'manual',
             (int)($src['rules_schedule_hour'] ?? 3),
             (int)($src['rules_schedule_wday'] ?? 1),
@@ -98,12 +106,39 @@ function cereus_datasync_copy_profile(int $id): int {
 
     // Copy function maps
     $fmaps = db_fetch_assoc_prepared('SELECT * FROM plugin_cds_function_maps WHERE profile_id = ?', [$id]);
+    $newMapIds = [];
     if (cacti_sizeof($fmaps)) {
         foreach ($fmaps as $f) {
             db_execute_prepared(
                 'INSERT INTO plugin_cds_function_maps (profile_id, device_function, host_template_id, snmp_check, enabled) VALUES (?, ?, ?, ?, ?)',
                 [$newId, $f['device_function'], (int)$f['host_template_id'], (int)$f['snmp_check'], $f['enabled']]
             );
+            $newMapIds[$f['id']] = (int)db_fetch_insert_id();
+        }
+    }
+
+    // Copy SNMP naming checks
+    $checks = db_fetch_assoc_prepared('SELECT * FROM plugin_cds_snmp_checks WHERE profile_id = ? ORDER BY id', [$id]);
+    if (cacti_sizeof($checks)) {
+        foreach ($checks as $c) {
+            db_execute_prepared(
+                'INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern, graph_query_type_id, all_functions)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [$newId, $c['enabled'], $c['name'], $c['oid'], (int)$c['operator'], $c['pattern'], (int)$c['graph_query_type_id'], (int)$c['all_functions']]
+            );
+            $newCheckId = (int)db_fetch_insert_id();
+
+            $links = db_fetch_assoc_prepared('SELECT function_map_id FROM plugin_cds_snmp_check_functions WHERE check_id = ?', [(int)$c['id']]);
+            if (cacti_sizeof($links)) {
+                foreach ($links as $l) {
+                    if (isset($newMapIds[$l['function_map_id']])) {
+                        db_execute_prepared(
+                            'INSERT INTO plugin_cds_snmp_check_functions (check_id, function_map_id) VALUES (?, ?)',
+                            [$newCheckId, $newMapIds[$l['function_map_id']]]
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -237,6 +272,12 @@ function cereus_datasync_save_function_map(int $profileId, string $func, int $te
 }
 
 function cereus_datasync_delete_function_map(int $mapId, int $profileId): void {
+    db_execute_prepared(
+        'DELETE l FROM plugin_cds_snmp_check_functions AS l
+         JOIN plugin_cds_function_maps AS m ON m.id = l.function_map_id
+         WHERE m.id = ? AND m.profile_id = ?',
+        [$mapId, $profileId]
+    );
     db_execute_prepared('DELETE FROM plugin_cds_function_maps WHERE id = ? AND profile_id = ?', [$mapId, $profileId]);
 }
 

@@ -185,7 +185,7 @@ function cereus_datasync_log_detail(int $runId): void {
             ['failed',         'failed',             __('Failed', 'cereus_datasync'),              '#dc2626'],
         ]],
         'graphs' => [__('Graphs', 'cereus_datasync'), [
-            [null,             'graphs_found',       __('WAN interfaces found', 'cereus_datasync'), '#0369a1'],
+            [null,             'graphs_found',       __('SNMP check matches', 'cereus_datasync'), '#0369a1'],
             ['graph_created',  'graphs_created',     __('Graphs created', 'cereus_datasync'),      '#0891b2'],
             ['tree_placed',    'tree_placed',        __('Placed on a tree', 'cereus_datasync'),    '#7c3aed'],
             ['graph_skip',     null,                 __('Graphs skipped', 'cereus_datasync'),      '#475569'],
@@ -268,7 +268,7 @@ function cereus_datasync_log_detail(int $runId): void {
         print '<div style="padding:8px 14px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#7c2d12;margin-bottom:10px;">';
         print __('Dry run: nothing was changed. The counts show what a real run would do.', 'cereus_datasync');
         if ($unchecked > 0) {
-            print ' ' . __('%d of the devices counted as added still need the SNMP interface check, which dry runs skip — a real run adds them only if an interface matches.', $unchecked, 'cereus_datasync');
+            print ' ' . __('%d of the devices counted as added still need the SNMP naming checks, which dry runs skip — a real run adds them only if a check matches.', $unchecked, 'cereus_datasync');
         }
         print '</div>';
     }

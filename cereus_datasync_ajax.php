@@ -21,6 +21,7 @@ chdir('../../');
 require('./include/auth.php');
 require_once(__DIR__ . '/lib/license_check.php');
 require_once(__DIR__ . '/lib/functions.php');
+require_once(__DIR__ . '/lib/snmp_checks.php');
 
 /**
  * Tree id posted by an autosave, falling back to the value already stored.
@@ -211,6 +212,74 @@ switch ($action) {
         $mapId = (int)get_filter_request_var('map_id', FILTER_VALIDATE_INT);
         $pid   = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
         cereus_datasync_delete_function_map($mapId, $pid);
+        print json_encode(['ok' => true]);
+        break;
+    }
+
+    // POST — add an SNMP naming check; the row comes back ready to insert
+    case 'add_snmp_check': {
+        $pid = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
+        if (!$pid) { print json_encode(['error' => 'Missing profile_id']); exit; }
+
+        $checkId = cereus_datasync_snmp_check_add($pid, __('New check', 'cereus_datasync'), '.1.3.6.1.2.1.31.1.1.1.18', '');
+        $check   = db_fetch_row_prepared('SELECT * FROM plugin_cds_snmp_checks WHERE id = ?', [$checkId]);
+        print json_encode(['id' => $checkId, 'html' => cereus_datasync_render_snmp_check_row($check, cereus_datasync_query_type_options(), cereus_datasync_get_function_maps($pid))]);
+        break;
+    }
+
+    // POST — update an SNMP naming check
+    case 'update_snmp_check': {
+        $checkId  = (int)get_filter_request_var('check_id', FILTER_VALIDATE_INT);
+        $pid      = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
+        $oid      = trim(get_nfilter_request_var('oid', ''));
+        $operator = (int)get_nfilter_request_var('operator', '1');
+
+        if (!$checkId || !$pid) { print json_encode(['error' => 'Missing params']); exit; }
+
+        if (!cereus_datasync_snmp_check_oid_valid($oid)) {
+            print json_encode(['error' => __('The OID must be numeric, e.g. .1.3.6.1.2.1.31.1.1.1.18', 'cereus_datasync')]);
+            exit;
+        }
+
+        if (!isset(cereus_datasync_snmp_check_operators()[$operator])) $operator = 1;
+
+        // The links below are not limited by the UPDATE, so make sure the check is this profile's
+        if (!db_fetch_cell_prepared('SELECT id FROM plugin_cds_snmp_checks WHERE id = ? AND profile_id = ?', [$checkId, $pid])) {
+            print json_encode(['error' => 'Check not found']);
+            exit;
+        }
+
+        db_execute_prepared(
+            'UPDATE plugin_cds_snmp_checks
+             SET enabled = ?, name = ?, oid = ?, operator = ?, pattern = ?, graph_query_type_id = ?, all_functions = ?
+             WHERE id = ? AND profile_id = ?',
+            [
+                get_nfilter_request_var('enabled', '') === 'on' ? 'on' : '',
+                substr(trim(get_nfilter_request_var('name', '')), 0, 128),
+                substr($oid, 0, 256),
+                $operator,
+                substr(trim(get_nfilter_request_var('pattern', '')), 0, 256),
+                (int)get_nfilter_request_var('graph_query_type_id', '0'),
+                get_nfilter_request_var('all_functions', '1') === '1' ? 1 : 0,
+                $checkId, $pid,
+            ]
+        );
+        cereus_datasync_snmp_check_set_functions($checkId, $pid, array_filter(explode(',', get_nfilter_request_var('functions', ''))));
+        print json_encode(['ok' => true]);
+        break;
+    }
+
+    // POST — delete an SNMP naming check
+    case 'delete_snmp_check': {
+        $checkId = (int)get_filter_request_var('check_id', FILTER_VALIDATE_INT);
+        $pid     = (int)get_filter_request_var('profile_id', FILTER_VALIDATE_INT);
+        db_execute_prepared(
+            'DELETE l FROM plugin_cds_snmp_check_functions AS l
+             JOIN plugin_cds_snmp_checks AS c ON c.id = l.check_id
+             WHERE c.id = ? AND c.profile_id = ?',
+            [$checkId, $pid]
+        );
+        db_execute_prepared('DELETE FROM plugin_cds_snmp_checks WHERE id = ? AND profile_id = ?', [$checkId, $pid]);
         print json_encode(['ok' => true]);
         break;
     }

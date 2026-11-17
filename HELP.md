@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.9.0.
+one. This guide covers version 1.11.0.
 
 ---
 
@@ -118,11 +118,37 @@ the profile list. You can keep several — one per region or customer, for examp
 
 1. **Device Function** — a value from your file's *Device Function* column.
 2. **Host Template** — the Cacti host template for devices with that function.
-3. **Interface Check** — tick to check these devices over SNMP before adding them:
-   only devices with an interface matching the *Interface Pattern* (for example
-   `-WAN-`) are added.
+3. **SNMP Check** — tick to check these devices over SNMP before adding them: only
+   devices that pass one of the *SNMP Naming Checks* for their function are added.
 4. **+ Add Mapping** — one row per function in your file. Devices whose function has
    no row are skipped and logged.
+
+### Which SNMP data decides whether a device is added
+
+**SNMP Naming Checks** holds one entry per piece of SNMP data to look at:
+
+| Field | Meaning |
+|---|---|
+| Name | Shown in the run log, so you can see why a device was added or skipped |
+| SNMP Data / OID | What to walk. Pick *ifAlias*, *ifDescr*, *ifName* or *Cisco IP SLA tag*, or type any numeric OID |
+| Match / Text | *contains*, *begins with*, *ends with* or *equals*; not case-sensitive |
+| Create Graphs | Optional data query and graph type; needs *Auto-create Graphs* |
+| Device Functions | *All device functions*, or only the functions you tick |
+
+- A device passes when **any** enabled entry for its function matches, on any row of
+  the walked data.
+- An entry with no text is ignored. If no complete entry is left for its function, a
+  device with *SNMP Check* ticked is skipped, and the log says why.
+- *Device Functions* also limits *Create Graphs*. A function without *SNMP Check* is
+  added without a check, but still gets graphs from the entries that apply to it.
+- An entry limited to chosen functions with none left, for example after deleting
+  the mapping, is not used.
+- An unreachable device matches nothing, so it is skipped too.
+- Checks walk with the SNMP community from the file (or the profile default), using
+  SNMP v2c and the profile's SNMP port.
+- *Create Graphs* makes one graph per matching row. The number after the OID has to
+  be the data query's index, as with `ifAlias` and the *SNMP - Interface Statistics*
+  query. A match the query does not know is logged as *Graphs skipped*.
 
 ### What happens to removed devices, and what gets created
 
@@ -132,16 +158,30 @@ the profile list. You can keep several — one per region or customer, for examp
    the file. Devices are never deleted automatically.
 2. **Flag Empty Sites** / **Flag Empty Tree Branches** — tag sites and branches left
    without devices ([section 10](#10-cleaning-up-empty-sites-and-branches)).
-3. **Auto-create WAN Graphs** — create a graph for each WAN interface of a new
-   device, using the *Data Query / Graph Template* below it.
-4. **Enable Auto Tree Rules** — turn on the tree rules of
+3. **Auto-create Graphs** — create graphs from the SNMP Naming Checks that have a
+   graph type: for a new device straight away, and on every later run for an existing
+   device that has no graph of that check's graph type yet (for example a check added
+   after the device). A device with at least one such graph is not walked again.
+4. **Graph Title Prefix** — text put in front of the title of every graph the profile
+   creates: naming check graphs, OID rule graphs and aggregate graphs. Include your own
+   separator, e.g. `NET - `. See the notes below.
+5. **Enable Auto Tree Rules** — turn on the tree rules of
    [section 7](#7-tree-placement-rules).
+
+**Notes on the graph title prefix**
+
+- Existing graphs keep their title. Aggregate graphs are the exception: their title
+  is rebuilt from the rule name on every run, so it follows the current prefix.
+- A rule condition that says a title *begins with* something stops matching prefixed
+  graphs. Use *contains*, or include the prefix in the condition.
+- Saving a graph template whose title is not per-graph, or running Cacti's *Reapply
+  Suggested Names*, replaces the title and removes the prefix.
 
 **Other settings on this page**
 
 | Section | Settings |
 |---|---|
-| Interface checks | Interface pattern, SNMP timeout, parallel workers (10–20 is a good range) |
+| SNMP checks | SNMP Naming Checks, SNMP timeout, parallel workers (10–20 is a good range) |
 | SNMP & Device Defaults | SNMP version, community, port, timeout, availability and ping method, poller |
 | Schedule | *Manual*, *Every poller cycle*, *Hourly*, *Daily* or *Weekly* — scheduled runs need Enterprise |
 
@@ -164,6 +204,9 @@ rule, or when graphs got new titles.
   from the site name the sync wrote (`region/country/site`).
 - Graphs that **already exist** and match a template are placed straight away.
 - Host rules, aggregate rules, OID rules and co-requisite groups are applied as well.
+- With *Auto-create Graphs* on, devices with no graph from an SNMP Naming Check yet
+  get that check's graphs. The check's device functions are found from the device's
+  host template through the function mappings.
 - The run appears in the log as *(rules only)* and does not change the profile's
   *Last Run* or its schedule.
 
@@ -193,7 +236,7 @@ spark chart of the same counter over the profile's last 20 runs of the same kind
 
 1. **Inventory file** — rows in the file, valid and dropped rows, devices in Cacti.
 2. **Devices** — added, updated, marked for deletion, **skipped**, failed.
-3. **Graphs** — WAN interfaces found, graphs created, graphs placed on a tree,
+3. **Graphs** — SNMP check matches, graphs created, graphs placed on a tree,
    graphs skipped and graph errors.
 4. **Tree rules & branches** — tree rules created, updated, or **already there
    unchanged**, rules skipped (with the reason: no matching graph, unresolved

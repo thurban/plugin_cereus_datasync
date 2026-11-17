@@ -149,3 +149,74 @@
 .cds-help blockquote { margin: 10px 0; padding: 8px 14px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 6px; }
 .cds-help blockquote p { margin: 0; }
 
+
+/* SNMP naming checks: wraps instead of forcing a wide table */
+.cds-check-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    align-items: flex-end;
+    padding: 10px 0;
+    border-bottom: 1px solid #e2e8f0;
+}
+.cds-check-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    flex: 1 1 150px;
+    min-width: 0;
+    max-width: 100%;
+    font-size: 12px;
+}
+.cds-check-field.cds-check-wide {
+    flex-basis: 300px;
+}
+.cds-check-field input[type="text"],
+.cds-check-field select,
+.cds-check-field .ui-selectmenu-button {
+    width: 100% !important;
+    max-width: 100%;
+    box-sizing: border-box;
+}
+.cds-check-enabled {
+    white-space: nowrap;
+    font-size: 12px;
+    padding-bottom: 6px;
+}
+.cds-check-del {
+    min-width: 0;
+    padding: 2px 8px;
+}
+.cds-check-scope {
+    flex-basis: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    align-items: center;
+    font-size: 12px;
+}
+.cds-check-scope-title {
+    font-weight: 600;
+}
+.cds-check-func-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+}
+.cds-check-func {
+    white-space: nowrap;
+}
+.cds-check-none {
+    color: #b45309;
+}
+.cds-check-status {
+    flex-basis: 100%;
+    font-size: 12px;
+    min-height: 0;
+}
+.cds-check-status:empty {
+    display: none;
+}
+.cds-check-status.cds-check-error {
+    color: #dc2626;
+}

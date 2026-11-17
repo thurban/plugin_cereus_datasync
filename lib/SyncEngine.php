@@ -4,6 +4,7 @@
 // Branch-path helpers are shared with the UI; poller_bottom loads this file on
 // its own, so pull them in here rather than relying on the caller.
 require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/snmp_checks.php';
 
 class CereusDatasyncEngine {
 
@@ -58,6 +59,7 @@ class CereusDatasyncEngine {
 
         $this->colMaps   = $this->loadColumnMaps();
         $this->funcMaps  = $this->loadFunctionMaps();
+        $this->snmpChecks = $this->loadSnmpChecks();
         $this->treeRules = $this->loadTreeRules();
         $this->aggRules  = $this->loadAggRules();
         $this->oidRules  = $this->loadOidRules();
@@ -223,14 +225,14 @@ class CereusDatasyncEngine {
                         'No function mapping for "' . $exDev['dev_function'] . '"');
                 } elseif ($this->profile['snmp_check_l2']
                        && isset($this->snmpCheckFunctions[$exDev['dev_function']])) {
-                    // Interface naming check enabled for this device function — SNMP walk first
+                    // SNMP naming check enabled for this device function — walk first
                     $l2check[] = $exDev;
                 } else {
-                    $toAdd[] = ['device' => $exDev, 'has_wan' => true];
+                    $toAdd[] = ['device' => $exDev, 'passed' => true];
                 }
             }
 
-            // ── SNMP interface name checks ────────────────────────────────
+            // ── SNMP naming checks ────────────────────────────────────
             if (!empty($l2check) && !$this->dryRun) {
                 $this->stats['checking'] = count($l2check);
                 $this->flushStats();
@@ -244,25 +246,30 @@ class CereusDatasyncEngine {
                     $snmpResults = $this->checkL2Parallel($l2check);
                     foreach ($l2check as $dev) {
                         $key    = $dev['hostname'] ?? $dev['ip'] ?? '';
-                        $hasWan = $snmpResults[$key]['has_wan'] ?? false;
-                        $toAdd[] = ['device' => $dev, 'has_wan' => $hasWan];
+                        $matched = $snmpResults[$key]['matched'] ?? null;
+                        $toAdd[] = ['device' => $dev, 'passed' => $matched !== null, 'matched' => $matched];
                         $this->stats['checking']--;
                     }
                     $this->flushStats();
                 } else {
-                    $callback = $devMgr->createSNMPCheckCallback();
                     foreach ($l2check as $dev) {
-                        $result  = $callback($dev);
-                        $toAdd[] = ['device' => $dev, 'has_wan' => $result['has_wan'] ?? false];
+                        $matched = cereus_datasync_snmp_check_device($this->checksForDevice($dev), [
+                            'hostname'  => $dev['ip'],
+                            'community' => $dev['snmp_community'] ?: $this->profile['default_snmp_community'],
+                            'port'      => (int)$this->profile['default_snmp_port'],
+                        ], (int)$this->profile['snmp_timeout_ms'] ?: 2000);
+                        $toAdd[] = ['device' => $dev, 'passed' => $matched !== null, 'matched' => $matched];
                         $this->stats['checking']--;
                         $this->flushStats();
                     }
                 }
             } elseif (!empty($l2check)) {
-                // Dry run — no SNMP, so the interface check cannot run: count the
-                // device as an add, but say it still depends on that check.
+                // Dry run — no SNMP, so the naming checks cannot run: count the
+                // device as an add, but say it still depends on that check. With no
+                // check for its function a real run skips it whatever SNMP says.
                 foreach ($l2check as $dev) {
-                    $toAdd[] = ['device' => $dev, 'has_wan' => true, 'unchecked' => true];
+                    $hasChecks = cacti_sizeof($this->checksForDevice($dev)) > 0;
+                    $toAdd[]   = ['device' => $dev, 'passed' => $hasChecks, 'unchecked' => $hasChecks];
                 }
             }
 
@@ -297,16 +304,16 @@ class CereusDatasyncEngine {
                 // and remove the now-stale placement under the old branch.
                 $this->stats['tree_placed'] += $this->reconcileTreePlacement((int)$upd['cactiDev']['id'], $upd['exDev']);
 
-                // Recheck WAN graphs for updated devices (only if no graphs exist yet)
-                $this->maybeCreateWanGraphs((int)$upd['cactiDev']['id'], $upd['exDev']);
+                // Recheck check graphs for updated devices (only checks without a graph yet)
+                $this->maybeCreateCheckGraphs((int)$upd['cactiDev']['id'], $upd['exDev']);
             }
 
             // ── Recheck graphs for unchanged existing devices ─────────────
-            // Only runs SNMP walk for devices that currently have no graphs at all,
-            // avoiding expensive walks on devices that were already fully set up.
+            // Walks only for checks the device has no graph from yet, avoiding
+            // expensive walks on devices that are already fully set up.
             if (!$this->dryRun) {
                 foreach ($toRecheck as $item) {
-                    $this->maybeCreateWanGraphs($item['deviceId'], $item['exDev']);
+                    $this->maybeCreateCheckGraphs($item['deviceId'], $item['exDev']);
                     $this->flushStats();
                 }
             }
@@ -314,14 +321,17 @@ class CereusDatasyncEngine {
             // ── Add new devices ───────────────────────────────────────────
             foreach ($toAdd as $item) {
                 $device  = $item['device'];
-                $hasWan  = $item['has_wan'];
+                $passed  = $item['passed'];
+                $checks  = $this->checksForDevice($device);
 
                 if ($this->profile['snmp_check_l2']
                     && isset($this->snmpCheckFunctions[$device['dev_function']])
-                    && !$hasWan) {
+                    && !$passed) {
                     $this->stats['skipped']++;
                     $this->logDetail('skipped', $device['hostname'], $device['ip'], null,
-                        'No interface matching pattern "' . ($this->profile['snmp_wan_pattern'] ?? '') . '"');
+                        cacti_sizeof($checks)
+                            ? 'No SNMP check matched: ' . implode(', ', array_column($checks, 'name'))
+                            : 'No enabled SNMP check applies to device function "' . $device['dev_function'] . '"');
                     continue;
                 }
 
@@ -329,8 +339,8 @@ class CereusDatasyncEngine {
                     $this->stats['added']++;
                     $this->logDetail('added_dry', $device['hostname'], $device['ip'], null,
                         !empty($item['unchecked'])
-                            ? 'dry-run — interface check not run; a real run adds it only if an interface matches "'
-                              . ($this->profile['snmp_wan_pattern'] ?? '') . '"'
+                            ? 'dry-run — interface check not run; a real run adds it only if one of these matches: '
+                              . implode(', ', array_column($checks, 'name'))
                             : 'dry-run');
                     continue;
                 }
@@ -338,14 +348,15 @@ class CereusDatasyncEngine {
                 $deviceId = $this->addDevice($device, $devMgr);
                 if ($deviceId) {
                     $this->stats['added']++;
-                    $this->logDetail('added', $device['hostname'], $device['ip'], $deviceId, '');
+                    $this->logDetail('added', $device['hostname'], $device['ip'], $deviceId,
+                        !empty($item['matched']) ? 'SNMP check matched: ' . $item['matched'] : '');
                     $this->flushStats(); // persist BEFORE risky operations — bare exit() in
                                         // template.php can kill the process mid-device
                     // Apply pattern-based tree placement rules
                     $placed = $this->applyTreeRules($deviceId, $device);
                     $this->stats['tree_placed'] += $placed;
-                    // Create WAN interface graphs (triggers Cacti automation → tree placement)
-                    $this->createWanGraphs($deviceId, $device);
+                    // Create graphs from the SNMP checks (triggers Cacti automation → tree placement)
+                    $this->createCheckGraphs($deviceId, $device);
                 } else {
                     $this->stats['failed']++;
                     $this->logDetail('failed', $device['hostname'], $device['ip'], null, 'api_device_save failed');
@@ -405,9 +416,11 @@ class CereusDatasyncEngine {
             throw new \RuntimeException("Profile $profileId not found");
         }
 
-        $this->treeRules = $this->loadTreeRules();
-        $this->aggRules  = $this->loadAggRules();
-        $this->oidRules  = $this->loadOidRules();
+        $this->funcMaps   = $this->loadFunctionMaps();
+        $this->snmpChecks = $this->loadSnmpChecks();
+        $this->treeRules  = $this->loadTreeRules();
+        $this->aggRules   = $this->loadAggRules();
+        $this->oidRules   = $this->loadOidRules();
 
         include_once $config['base_path'] . '/lib/api_automation.php';
         include_once $config['base_path'] . '/lib/api_tree.php';
@@ -433,6 +446,16 @@ class CereusDatasyncEngine {
                 $this->stats['tree_placed'] += $this->applyTreeRules((int)$device['id'], $device);
             }
 
+            // SNMP check graphs for devices that lack them — e.g. a check added
+            // after the device, which the sync itself never revisits.
+            if (!empty($this->profile['auto_create_graphs']) && cacti_sizeof($this->snmpChecks)) {
+                foreach ($devices as $device) {
+                    if ($device['disabled'] === 'on') continue;
+                    $this->maybeCreateCheckGraphs((int)$device['id'], $device);
+                    $this->flushStats();
+                }
+            }
+
             $this->applyAggregateRules();
             $this->applyOidGraphRules();
             $this->applyTitleTagTemplates();
@@ -455,7 +478,7 @@ class CereusDatasyncEngine {
      * "region/country/site"; sites flagged with the deletion tag are skipped.
      */
     private function cactiDevicesBySite(): array {
-        $rows = db_fetch_assoc('SELECT h.id, h.description, h.hostname, s.name AS site_name
+        $rows = db_fetch_assoc('SELECT h.id, h.description, h.hostname, h.host_template_id, h.disabled, s.name AS site_name
             FROM host AS h
             INNER JOIN sites AS s ON s.id = h.site_id
             ORDER BY s.name, h.description');
@@ -482,6 +505,10 @@ class CereusDatasyncEngine {
                 'region'   => $region,
                 'country'  => $country,
                 'site'     => $site,
+                // No dev_function here: tree rules would read it. The SNMP checks
+                // find the device's function(s) from its host template instead.
+                'host_template_id' => (int)$row['host_template_id'],
+                'disabled'         => (string)$row['disabled'],
             ];
         }
 
@@ -513,7 +540,62 @@ class CereusDatasyncEngine {
         return $map;
     }
 
-    private array $snmpCheckFunctions = []; // device functions that have interface check enabled
+    private array $snmpCheckFunctions = []; // device functions that have the SNMP check enabled
+    private array $snmpChecks = [];         // enabled, complete SNMP naming checks
+
+    private function loadSnmpChecks(): array {
+        $rows = db_fetch_assoc_prepared(
+            "SELECT * FROM plugin_cds_snmp_checks WHERE profile_id = ? AND enabled = 'on' ORDER BY id",
+            [(int)$this->profile['id']]
+        );
+        if (!cacti_sizeof($rows)) return [];
+
+        $functions = [];
+        $links = db_fetch_assoc_prepared(
+            'SELECT l.check_id, m.device_function
+             FROM plugin_cds_snmp_check_functions AS l
+             JOIN plugin_cds_function_maps AS m ON m.id = l.function_map_id
+             WHERE m.profile_id = ?',
+            [(int)$this->profile['id']]
+        );
+        if (cacti_sizeof($links)) {
+            foreach ($links as $link) {
+                $functions[$link['check_id']][] = $link['device_function'];
+            }
+        }
+
+        foreach ($rows as &$row) {
+            $row['functions'] = $functions[$row['id']] ?? [];
+        }
+        unset($row);
+
+        return array_values(array_filter($rows, function ($check) {
+            return trim($check['pattern']) !== '' && cereus_datasync_snmp_check_oid_valid($check['oid']);
+        }));
+    }
+
+    private function checksForDevice(array $device): array {
+        if (isset($device['dev_function']) || !isset($device['host_template_id'])) {
+            return cereus_datasync_snmp_checks_for_function($this->snmpChecks, (string)($device['dev_function'] ?? ''));
+        }
+
+        // A Cacti device without an inventory row (rules-only run): every function
+        // mapped to its host template applies. Checks for all functions always do.
+        $functions = array_keys($this->funcMaps, (int)$device['host_template_id'], true);
+        $checks    = cereus_datasync_snmp_checks_for_function($this->snmpChecks, '');
+        foreach ($functions as $function) {
+            foreach (cereus_datasync_snmp_checks_for_function($this->snmpChecks, (string)$function) as $check) {
+                $checks[] = $check;
+            }
+        }
+
+        $unique = [];
+        foreach ($checks as $check) {
+            $unique[$check['id']] = $check;
+        }
+
+        return array_values($unique);
+    }
 
     private function loadFunctionMaps(): array {
         $rows = db_fetch_assoc_prepared(
@@ -661,7 +743,7 @@ class CereusDatasyncEngine {
             }
 
             $attribs = [
-                'graph_title'           => $rule['name'],
+                'graph_title'           => ($this->profile['graph_title_prefix'] ?? '') . $rule['name'],
                 'aggregate_template_id' => $aggTemplateId,
                 'graph_template_id'     => $graphTemplateId,
                 'aggregate_graph_id'    => $resultGraphId,
@@ -914,7 +996,7 @@ class CereusDatasyncEngine {
                 // sets both atomically — title_cache is resolved, OID lands in data_input_data.
                 $suggestedVals = [
                     $graphTemplateId => [
-                        'graph_template' => ['title' => $rule['name']],
+                        'graph_template' => ['title' => ($this->profile['graph_title_prefix'] ?? '') . $rule['name']],
                         'custom_data'    => [
                             $dataTemplateId => [$oidFieldId => $oid],
                         ],
@@ -1050,25 +1132,45 @@ class CereusDatasyncEngine {
         return (int)$deviceId;
     }
 
-    // ─── WAN interface graph creation ────────────────────────────────────────
+    // ─── Graph creation from SNMP checks ─────────────────────────────────────
 
-    // Only creates graphs when the device has none yet — avoids SNMP-walking
-    // every existing device on every sync run.
-    private function maybeCreateWanGraphs(int $deviceId, array $device): void {
+    // Per check: walks only for checks the device has no graph from yet, so a
+    // check added later still reaches existing devices, while devices already
+    // set up for every check are not SNMP-walked on each run.
+    private function maybeCreateCheckGraphs(int $deviceId, array $device): void {
         if (empty($this->profile['auto_create_graphs'])) return;
-        $hasGraphs = (int)db_fetch_cell_prepared(
-            'SELECT COUNT(*) FROM graph_local WHERE host_id = ?', [$deviceId]
-        );
-        if (!$hasGraphs) {
-            $this->createWanGraphs($deviceId, $device);
+
+        foreach ($this->checksForDevice($device) as $check) {
+            $queryTypeId = (int)$check['graph_query_type_id'];
+            if (!$queryTypeId || $this->deviceHasCheckGraph($deviceId, $queryTypeId)) continue;
+            $this->createGraphsForCheck($deviceId, $device, $check);
         }
     }
 
-    private function createWanGraphs(int $deviceId, array $device): void {
+    // Whether the device has any graph of the check's data query graph type.
+    private function deviceHasCheckGraph(int $deviceId, int $queryTypeId): bool {
+        return (bool)db_fetch_cell_prepared(
+            'SELECT gl.id FROM graph_local AS gl
+             INNER JOIN snmp_query_graph AS sqg
+                ON sqg.snmp_query_id = gl.snmp_query_id AND sqg.graph_template_id = gl.graph_template_id
+             WHERE gl.host_id = ? AND sqg.id = ?
+             LIMIT 1',
+            [$deviceId, $queryTypeId]
+        );
+    }
+
+    private function createCheckGraphs(int $deviceId, array $device): void {
         if (empty($this->profile['auto_create_graphs'])) return;
 
-        $queryTypeId = (int)$this->profile['graph_query_type_id'];
-        if (!$queryTypeId) return;
+        foreach ($this->checksForDevice($device) as $check) {
+            if ((int)$check['graph_query_type_id']) {
+                $this->createGraphsForCheck($deviceId, $device, $check);
+            }
+        }
+    }
+
+    private function createGraphsForCheck(int $deviceId, array $device, array $check): void {
+        $queryTypeId = (int)$check['graph_query_type_id'];
 
         global $config;
 
@@ -1090,7 +1192,6 @@ class CereusDatasyncEngine {
 
         $snmpQueryId = (int)$qtype['snmp_query_id'];
         $templateId  = (int)$qtype['graph_template_id'];
-        $wanPattern  = trim($this->profile['snmp_wan_pattern'] ?? '-WAN-') ?: '-WAN-';
 
         // Associate the data query with the device if not already
         $assoc = db_fetch_cell_prepared(
@@ -1111,25 +1212,45 @@ class CereusDatasyncEngine {
             return;
         }
 
-        // Find interfaces whose ifAlias matches the WAN pattern
-        $interfaces = db_fetch_assoc_prepared(
-            "SELECT DISTINCT snmp_index FROM host_snmp_cache
-             WHERE host_id = ? AND snmp_query_id = ?
-               AND field_name = 'ifAlias' AND field_value LIKE ?",
-            [$deviceId, $snmpQueryId, '%' . $wanPattern . '%']
-        );
+        // Find the rows the check matches, using the credentials the device was saved with
+        $host = db_fetch_row_prepared('SELECT * FROM host WHERE id = ?', [$deviceId]);
+        $matched = cereus_datasync_snmp_check_walk($check, [
+            'hostname'        => $host['hostname'],
+            'community'       => $host['snmp_community'],
+            'version'         => $host['snmp_version'],
+            'username'        => $host['snmp_username'],
+            'password'        => $host['snmp_password'],
+            'auth_protocol'   => $host['snmp_auth_protocol'],
+            'priv_passphrase' => $host['snmp_priv_passphrase'],
+            'priv_protocol'   => $host['snmp_priv_protocol'],
+            'context'         => $host['snmp_context'],
+            'engine_id'       => $host['snmp_engine_id'],
+            'port'            => $host['snmp_port'],
+            'max_oids'        => $host['max_oids'],
+        ], (int)$this->profile['snmp_timeout_ms'] ?: 2000);
 
-        if (!cacti_sizeof($interfaces)) {
-            return; // no matching interfaces — normal for unreachable or non-WAN devices
+        if (!cacti_sizeof($matched)) {
+            return; // nothing matches — normal for unreachable devices or those without this data
         }
 
-        $this->stats['graphs_found'] += count($interfaces);
+        // A graph needs a row in the data query; the check's OID may belong to another table
+        $known = array_column(db_fetch_assoc_prepared(
+            'SELECT DISTINCT snmp_index FROM host_snmp_cache WHERE host_id = ? AND snmp_query_id = ?',
+            [$deviceId, $snmpQueryId]
+        ), 'snmp_index');
+        $indexes = array_values(array_intersect(array_unique($matched), $known));
+
+        if (count($indexes) < count(array_unique($matched))) {
+            $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $deviceId,
+                'Check "' . $check['name'] . '": ' . (count(array_unique($matched)) - count($indexes))
+                . ' matching row(s) not found in the data query');
+        }
+
+        $this->stats['graphs_found'] += count($indexes);
 
         $snmpIndexOn = get_best_data_query_index_type($deviceId, $snmpQueryId);
 
-        foreach ($interfaces as $iface) {
-            $snmpIndex = $iface['snmp_index'];
-
+        foreach ($indexes as $snmpIndex) {
             // Skip if a graph already exists for this device + template + query + index
             $exists = db_fetch_cell_prepared(
                 'SELECT id FROM graph_local
@@ -1159,6 +1280,7 @@ class CereusDatasyncEngine {
 
             if ($result !== false) {
                 $this->stats['graphs_created']++;
+                $this->prefixGraphTitle((int)$result['local_graph_id']);
                 if (!empty($result['local_data_id'])) {
                     foreach ($result['local_data_id'] as $dataId) {
                         push_out_host($deviceId, $dataId);
@@ -1172,6 +1294,22 @@ class CereusDatasyncEngine {
                 $this->countTreePlacement((int)$result['local_graph_id'], $device['hostname'], $device['ip'], $deviceId);
             }
         }
+    }
+
+    /**
+     * A data query graph gets its title from the query's suggested values while
+     * it is created, so the prefix can only go on afterwards. It goes into the
+     * title itself, not just title_cache, or the next cache refresh would drop it.
+     */
+    private function prefixGraphTitle(int $graphId): void {
+        $prefix = $this->profile['graph_title_prefix'] ?? '';
+        if ($prefix === '') return;
+
+        db_execute_prepared(
+            'UPDATE graph_templates_graph SET title = CONCAT(?, title) WHERE local_graph_id = ?',
+            [$prefix, $graphId]
+        );
+        update_graph_title_cache($graphId);
     }
 
     // ─── Template-driven Cacti automation rule generation ────────────────────
@@ -2784,7 +2922,6 @@ class CereusDatasyncEngine {
 
         $phpBin     = read_config_option('path_php_binary') ?: '/usr/bin/php';
         $worker     = dirname(__DIR__) . '/cereus_datasync_snmp_worker.php';
-        $wanPattern = trim($this->profile['snmp_wan_pattern'] ?? '-WAN-') ?: '-WAN-';
         $timeoutMs  = (int)$this->profile['snmp_timeout_ms'] ?: 2000;
 
         if (!file_exists($worker)) {
@@ -2800,8 +2937,8 @@ class CereusDatasyncEngine {
 
         $cmd = escapeshellcmd($phpBin) . ' '
              . escapeshellarg($worker) . ' '
-             . escapeshellarg($wanPattern) . ' '
-             . (int)$timeoutMs;
+             . (int)$timeoutMs . ' '
+             . (int)$this->profile['default_snmp_port'];
 
         // Launch all workers concurrently
         $procs = [];
@@ -2814,7 +2951,7 @@ class CereusDatasyncEngine {
             $proc = proc_open($cmd, $desc, $pipes);
             if (!is_resource($proc)) continue;
 
-            fwrite($pipes[0], json_encode($chunk));
+            fwrite($pipes[0], json_encode(['checks' => $this->snmpChecks, 'devices' => $chunk]));
             fclose($pipes[0]);
 
             $procs[] = ['proc' => $proc, 'out' => $pipes[1]];

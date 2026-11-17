@@ -1,9 +1,9 @@
 <?php
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Parallel SNMP WAN-check worker — launched by SyncEngine via proc_open().
-// Reads a JSON device batch from stdin. No database access.
+// Parallel SNMP naming-check worker — launched by SyncEngine via proc_open().
+// Reads the checks and a JSON device batch from stdin. No database access.
 // Outputs JSON results to stdout. Called as:
-//   php cereus_datasync_snmp_worker.php <wan_pattern> <timeout_ms>
+//   php cereus_datasync_snmp_worker.php <timeout_ms> <port>
 
 if (php_sapi_name() !== 'cli') { http_response_code(403); exit; }
 
@@ -15,11 +15,14 @@ $no_http_headers = true;
 define('CACTI_CLI_ONLY', true);
 require('./include/global.php');
 require_once('./lib/snmp.php');
+require_once(__DIR__ . '/lib/snmp_checks.php');
 
-$wanPattern  = $argv[1] ?? '-WAN-';
-$timeoutMs   = (int)($argv[2] ?? 2000);
+$timeoutMs = (int)($argv[1] ?? 2000);
+$port      = (int)($argv[2] ?? 161);
 
-$devices = json_decode(file_get_contents('php://stdin'), true);
+$input   = json_decode(file_get_contents('php://stdin'), true);
+$checks  = $input['checks']  ?? [];
+$devices = $input['devices'] ?? null;
 if (!is_array($devices)) {
     echo json_encode([]);
     exit;
@@ -32,34 +35,13 @@ foreach ($devices as $dev) {
     $community = trim($dev['snmp_community'] ?? 'public') ?: 'public';
     $key       = $dev['hostname']            ?? $ip;
 
-    if (empty($ip)) {
-        $results[$key] = ['has_wan' => false];
-        continue;
-    }
-
-    $hasWan = false;
-
-    $ifAliases = @cacti_snmp_walk(
-        $ip, $community,
-        '.1.3.6.1.2.1.31.1.1.1.18',  // ifAlias OID
-        2,                             // SNMPv2c
-        '', '', '', '', '', '',        // v3 params (unused)
-        161,                           // port
-        $timeoutMs,
-        1,                             // retries
-        10                             // max OIDs
-    );
-
-    if (is_array($ifAliases)) {
-        foreach ($ifAliases as $entry) {
-            if (stripos($entry['value'] ?? '', $wanPattern) !== false) {
-                $hasWan = true;
-                break;
-            }
-        }
-    }
-
-    $results[$key] = ['has_wan' => $hasWan];
+    $results[$key] = [
+        'matched' => empty($ip) ? null : cereus_datasync_snmp_check_device(cereus_datasync_snmp_checks_for_function($checks, (string)($dev['dev_function'] ?? '')), [
+            'hostname'  => $ip,
+            'community' => $community,
+            'port'      => $port,
+        ], $timeoutMs),
+    ];
 }
 
 echo json_encode($results);

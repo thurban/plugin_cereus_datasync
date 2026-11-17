@@ -25,6 +25,8 @@ function plugin_cereus_datasync_uninstall() {
     db_execute('DROP TABLE IF EXISTS plugin_cds_agg_conditions');
     db_execute('DROP TABLE IF EXISTS plugin_cds_aggregate_rules');
     db_execute('DROP TABLE IF EXISTS plugin_cds_oid_rules');
+    db_execute('DROP TABLE IF EXISTS plugin_cds_snmp_check_functions');
+    db_execute('DROP TABLE IF EXISTS plugin_cds_snmp_checks');
     db_execute('DROP TABLE IF EXISTS plugin_cds_function_maps');
     db_execute('DROP TABLE IF EXISTS plugin_cds_column_maps');
     db_execute('DROP TABLE IF EXISTS plugin_cds_profiles');
@@ -264,6 +266,7 @@ function cereus_datasync_setup_tables() {
         auto_graph_rules           TINYINT(1)       NOT NULL DEFAULT 0,
         auto_create_graphs         TINYINT(1)       NOT NULL DEFAULT 0,
         graph_query_type_id        INT UNSIGNED     NOT NULL DEFAULT 0,
+        graph_title_prefix         VARCHAR(64)      NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
         last_run_at                TIMESTAMP        NULL DEFAULT NULL,
         last_run_status            VARCHAR(20)      NOT NULL DEFAULT '',
         last_run_stats             JSON,
@@ -570,6 +573,52 @@ function cereus_datasync_setup_tables() {
         db_execute("ALTER TABLE plugin_cds_profiles
             ADD COLUMN auto_create_graphs  TINYINT(1)   NOT NULL DEFAULT 0 AFTER auto_graph_rules,
             ADD COLUMN graph_query_type_id INT UNSIGNED NOT NULL DEFAULT 0 AFTER auto_create_graphs");
+    }
+
+    // SNMP naming checks replace the profile's single interface pattern and graph
+    // type. Seed only when the table is new, so deleted entries stay deleted.
+    $seedChecks = !db_table_exists('plugin_cds_snmp_checks');
+
+    db_execute("CREATE TABLE IF NOT EXISTS plugin_cds_snmp_checks (
+        id                  INT UNSIGNED     NOT NULL AUTO_INCREMENT,
+        profile_id          INT UNSIGNED     NOT NULL,
+        enabled             CHAR(2)          NOT NULL DEFAULT 'on',
+        name                VARCHAR(128)     NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
+        oid                 VARCHAR(256)     NOT NULL DEFAULT '',
+        operator            TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        pattern             VARCHAR(256)     NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci,
+        graph_query_type_id INT UNSIGNED     NOT NULL DEFAULT 0,
+        all_functions       TINYINT(1)       NOT NULL DEFAULT 1,
+        PRIMARY KEY (id),
+        INDEX idx_profile (profile_id)
+    ) $charset");
+
+    // Migration: naming checks can be limited to chosen device functions
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_snmp_checks LIKE 'all_functions'"))) {
+        db_execute("ALTER TABLE plugin_cds_snmp_checks
+            ADD COLUMN all_functions TINYINT(1) NOT NULL DEFAULT 1 AFTER graph_query_type_id");
+    }
+
+    db_execute("CREATE TABLE IF NOT EXISTS plugin_cds_snmp_check_functions (
+        check_id        INT UNSIGNED NOT NULL,
+        function_map_id INT UNSIGNED NOT NULL,
+        PRIMARY KEY (check_id, function_map_id),
+        INDEX idx_function_map (function_map_id)
+    ) $charset");
+
+    // Page requests can run the upgrade concurrently, so skip a profile already seeded.
+    if ($seedChecks) {
+        db_execute("INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern, graph_query_type_id)
+            SELECT p.id, 'on', 'WAN interfaces', '.1.3.6.1.2.1.31.1.1.1.18', 1, p.snmp_wan_pattern, p.graph_query_type_id
+            FROM plugin_cds_profiles AS p
+            LEFT JOIN plugin_cds_snmp_checks AS c ON c.profile_id = p.id
+            WHERE c.id IS NULL");
+    }
+
+    // Migration: a title prefix for the graphs a profile creates
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_profiles LIKE 'graph_title_prefix'"))) {
+        db_execute("ALTER TABLE plugin_cds_profiles
+            ADD COLUMN graph_title_prefix VARCHAR(64) NOT NULL DEFAULT '' COLLATE utf8mb4_unicode_ci AFTER graph_query_type_id");
     }
 
     // Migration: add empty-container marking toggles to existing installs

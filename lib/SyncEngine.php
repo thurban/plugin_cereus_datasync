@@ -199,7 +199,6 @@ class CereusDatasyncEngine {
             // ── Categorise Excel devices ──────────────────────────────────
             $toAdd      = [];
             $toUpdate   = [];
-            $toRecheck  = []; // existing devices with no metadata changes — still need graph recheck
             $l2check    = [];
 
             foreach ($excelDevices as $exDev) {
@@ -215,9 +214,6 @@ class CereusDatasyncEngine {
 
                     if ($descChanged || $locChanged) {
                         $toUpdate[] = compact('exDev', 'cactiDev', 'exLocation', 'exSiteId', 'descChanged', 'locChanged');
-                    } else {
-                        // No metadata change — queue for graph recheck only
-                        $toRecheck[] = ['deviceId' => (int)$cactiDev['id'], 'exDev' => $exDev];
                     }
                 } elseif (!isset($this->funcMaps[$exDev['dev_function']])) {
                     $this->stats['skipped']++;
@@ -303,22 +299,13 @@ class CereusDatasyncEngine {
                 // the device in the tree so its branch follows the new location,
                 // and remove the now-stale placement under the old branch.
                 $this->stats['tree_placed'] += $this->reconcileTreePlacement((int)$upd['cactiDev']['id'], $upd['exDev']);
-
-                // Recheck check graphs for updated devices (only checks without a graph yet)
-                $this->maybeCreateCheckGraphs((int)$upd['cactiDev']['id'], $upd['exDev']);
             }
 
-            // ── Recheck graphs for unchanged existing devices ─────────────
-            // Walks only for checks the device has no graph from yet, avoiding
-            // expensive walks on devices that are already fully set up.
-            if (!$this->dryRun) {
-                foreach ($toRecheck as $item) {
-                    $this->maybeCreateCheckGraphs($item['deviceId'], $item['exDev']);
-                    $this->flushStats();
-                }
-            }
+            // Devices already in Cacti are not SNMP-walked: their graphs come from
+            // Cacti's Graph Rules whenever Cacti re-indexes them.
 
             // ── Add new devices ───────────────────────────────────────────
+            $added = [];
             foreach ($toAdd as $item) {
                 $device  = $item['device'];
                 $passed  = $item['passed'];
@@ -355,8 +342,7 @@ class CereusDatasyncEngine {
                     // Apply pattern-based tree placement rules
                     $placed = $this->applyTreeRules($deviceId, $device);
                     $this->stats['tree_placed'] += $placed;
-                    // Create graphs from the SNMP checks (triggers Cacti automation → tree placement)
-                    $this->createCheckGraphs($deviceId, $device);
+                    $added[] = ['id' => $deviceId, 'device' => $device];
                 } else {
                     $this->stats['failed']++;
                     $this->logDetail('failed', $device['hostname'], $device['ip'], null, 'api_device_save failed');
@@ -364,6 +350,18 @@ class CereusDatasyncEngine {
                 }
 
                 usleep(100000); // 0.1s between adds
+            }
+
+            // ── Graphs for the new devices, from Cacti's Graph Rules ──────
+            if (!$this->dryRun && !empty($this->profile['auto_create_graphs']) && cacti_sizeof($added)) {
+                $jobs = [];
+                foreach ($added as $a) {
+                    $queries = $this->ruledQueries($a['id']);
+                    if (cacti_sizeof($queries)) {
+                        $jobs[] = ['host_id' => $a['id'], 'queries' => $queries, 'device' => $a['device']];
+                    }
+                }
+                $this->indexDevices($jobs);
             }
 
             // ── Apply aggregate graph rules (post-sync, live runs only) ────────
@@ -446,14 +444,10 @@ class CereusDatasyncEngine {
                 $this->stats['tree_placed'] += $this->applyTreeRules((int)$device['id'], $device);
             }
 
-            // SNMP check graphs for devices that lack them — e.g. a check added
-            // after the device, which the sync itself never revisits.
-            if (!empty($this->profile['auto_create_graphs']) && cacti_sizeof($this->snmpChecks)) {
-                foreach ($devices as $device) {
-                    if ($device['disabled'] === 'on') continue;
-                    $this->maybeCreateCheckGraphs((int)$device['id'], $device);
-                    $this->flushStats();
-                }
+            // Graph Rules for the devices already in Cacti — e.g. a rule added
+            // after the device, which Cacti itself only applies on a re-index.
+            if (!empty($this->profile['auto_create_graphs'])) {
+                $this->applyGraphRules($devices);
             }
 
             $this->applyAggregateRules();
@@ -569,9 +563,7 @@ class CereusDatasyncEngine {
         }
         unset($row);
 
-        return array_values(array_filter($rows, function ($check) {
-            return trim($check['pattern']) !== '' && cereus_datasync_snmp_check_oid_valid($check['oid']);
-        }));
+        return array_values(array_filter($rows, 'cereus_datasync_snmp_check_complete'));
     }
 
     private function checksForDevice(array $device): array {
@@ -1107,8 +1099,8 @@ class CereusDatasyncEngine {
             );
             db_execute_prepared(
                 'INSERT IGNORE INTO host_snmp_query (host_id, snmp_query_id, reindex_method)
-                 SELECT ?, snmp_query_id, 0 FROM host_template_snmp_query WHERE host_template_id = ?',
-                [$deviceId, $templateId]
+                 SELECT ?, snmp_query_id, ? FROM host_template_snmp_query WHERE host_template_id = ?',
+                [$deviceId, (int)read_config_option('reindex_method'), $templateId]
             );
         }
 
@@ -1132,167 +1124,184 @@ class CereusDatasyncEngine {
         return (int)$deviceId;
     }
 
-    // ─── Graph creation from SNMP checks ─────────────────────────────────────
+    // ─── Graphs from Cacti's Graph Rules ─────────────────────────────────────
 
-    // Per check: walks only for checks the device has no graph from yet, so a
-    // check added later still reaches existing devices, while devices already
-    // set up for every check are not SNMP-walked on each run.
-    private function maybeCreateCheckGraphs(int $deviceId, array $device): void {
-        if (empty($this->profile['auto_create_graphs'])) return;
-
-        foreach ($this->checksForDevice($device) as $check) {
-            $queryTypeId = (int)$check['graph_query_type_id'];
-            if (!$queryTypeId || $this->deviceHasCheckGraph($deviceId, $queryTypeId)) continue;
-            $this->createGraphsForCheck($deviceId, $device, $check);
-        }
+    // The device's data queries that an enabled Graph Rule creates graphs from.
+    private function ruledQueries(int $deviceId): array {
+        return array_map('intval', array_column(db_fetch_assoc_prepared(
+            "SELECT DISTINCT hsq.snmp_query_id
+             FROM host_snmp_query AS hsq
+             INNER JOIN automation_graph_rules AS agr
+                ON agr.snmp_query_id = hsq.snmp_query_id AND agr.enabled = 'on'
+             WHERE hsq.host_id = ?
+             ORDER BY hsq.snmp_query_id",
+            [$deviceId]
+        ), 'snmp_query_id'));
     }
 
-    // Whether the device has any graph of the check's data query graph type.
-    private function deviceHasCheckGraph(int $deviceId, int $queryTypeId): bool {
-        return (bool)db_fetch_cell_prepared(
-            'SELECT gl.id FROM graph_local AS gl
-             INNER JOIN snmp_query_graph AS sqg
-                ON sqg.snmp_query_id = gl.snmp_query_id AND sqg.graph_template_id = gl.graph_template_id
-             WHERE gl.host_id = ? AND sqg.id = ?
-             LIMIT 1',
-            [$deviceId, $queryTypeId]
-        );
-    }
-
-    private function createCheckGraphs(int $deviceId, array $device): void {
-        if (empty($this->profile['auto_create_graphs'])) return;
-
-        foreach ($this->checksForDevice($device) as $check) {
-            if ((int)$check['graph_query_type_id']) {
-                $this->createGraphsForCheck($deviceId, $device, $check);
-            }
-        }
-    }
-
-    private function createGraphsForCheck(int $deviceId, array $device, array $check): void {
-        $queryTypeId = (int)$check['graph_query_type_id'];
-
+    /**
+     * Devices already in Cacti: run the Graph Rules from the index data Cacti
+     * already holds, without SNMP. Only a data query the device was never indexed
+     * for — no cached rows and never indexed by this plugin — is walked, once.
+     */
+    private function applyGraphRules(array $devices): void {
         global $config;
 
-        $base = $config['base_path'] . '/';
-        // Each file is required independently so a missing one doesn't block others
-        if (!function_exists('api_device_dq_add'))                 require_once $base . 'lib/api_device.php';
-        if (!function_exists('run_data_query'))                     require_once $base . 'lib/data_query.php';
-        if (!function_exists('push_out_host'))                      require_once $base . 'lib/utility.php';
-        if (!function_exists('create_complete_graph_from_template')) require_once $base . 'lib/template.php';
-        if (!function_exists('get_graph_template_graph'))           require_once $base . 'lib/api_graph.php';
-        if (!function_exists('get_data_template_item'))             require_once $base . 'lib/api_data_source.php';
-        if (!function_exists('api_tree_graph_exists'))              require_once $base . 'lib/api_tree.php';
-
-        // Look up the snmp_query_graph record — contains snmp_query_id + graph_template_id
-        $qtype = db_fetch_row_prepared(
-            'SELECT * FROM snmp_query_graph WHERE id = ?', [$queryTypeId]
-        );
-        if (!$qtype) return;
-
-        $snmpQueryId = (int)$qtype['snmp_query_id'];
-        $templateId  = (int)$qtype['graph_template_id'];
-
-        // Associate the data query with the device if not already
-        $assoc = db_fetch_cell_prepared(
-            'SELECT host_id FROM host_snmp_query WHERE host_id = ? AND snmp_query_id = ?',
-            [$deviceId, $snmpQueryId]
-        );
-        if (!$assoc) {
-            api_device_dq_add($deviceId, $snmpQueryId, DATA_QUERY_AUTOINDEX_NONE);
+        $base = $config['base_path'] . '/lib/';
+        foreach (['api_data_source', 'api_graph', 'data_query', 'template', 'utility', 'sort'] as $lib) {
+            include_once $base . $lib . '.php';
         }
 
-        // SNMP walk — populates host_snmp_cache with interface data
-        // Wrapped in try/catch so an SNMP failure on one device doesn't abort the run.
-        try {
-            run_data_query($deviceId, $snmpQueryId);
-        } catch (\Throwable $e) {
-            $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $deviceId,
-                'run_data_query failed: ' . $e->getMessage());
+        $jobs = [];
+        foreach ($devices as $device) {
+            if (($device['disabled'] ?? '') === 'on') continue;
+
+            $deviceId = (int)$device['id'];
+            $queries  = $this->ruledQueries($deviceId);
+            if (!cacti_sizeof($queries)) continue;
+
+            $indexed = array_map('intval', array_column(db_fetch_assoc_prepared(
+                'SELECT snmp_query_id FROM host_snmp_cache WHERE host_id = ? GROUP BY snmp_query_id
+                 UNION
+                 SELECT snmp_query_id FROM plugin_cds_dq_indexed WHERE host_id = ?',
+                [$deviceId, $deviceId]
+            ), 'snmp_query_id'));
+
+            $walk   = array_values(array_diff($queries, $indexed));
+            $before = (int)db_fetch_cell_prepared('SELECT COALESCE(MAX(id), 0) FROM graph_local WHERE host_id = ?', [$deviceId]);
+
+            foreach (array_intersect($queries, $indexed) as $queryId) {
+                try {
+                    automation_execute_data_query($deviceId, $queryId);
+                } catch (\Throwable $e) {
+                    $this->logDetail('graph_error', $device['hostname'], $device['ip'], $deviceId,
+                        'Graph Rules for data query ' . $queryId . ' failed: ' . $e->getMessage());
+                }
+            }
+
+            $graphIds = array_map('intval', array_column(db_fetch_assoc_prepared(
+                'SELECT id FROM graph_local WHERE host_id = ? AND id > ? ORDER BY id',
+                [$deviceId, $before]
+            ), 'id'));
+            foreach ($graphIds as $graphId) {
+                $this->prefixGraphTitle($graphId);
+            }
+            $this->recordRuleGraphs($deviceId, $device, $graphIds);
+
+            if (cacti_sizeof($walk)) {
+                $jobs[] = ['host_id' => $deviceId, 'queries' => $walk, 'device' => $device];
+            }
+        }
+
+        $this->flushStats();
+        $this->indexDevices($jobs);
+    }
+
+    /**
+     * Index data queries in worker processes — each run_data_query() applies the
+     * Graph Rules, and Cacti's tree rules place the graphs they create. A device
+     * is walked once per data query; devices of one site share a worker so two
+     * workers do not create the same tree branch at once.
+     *
+     * $jobs: [['host_id' => int, 'queries' => int[], 'device' => inventory row], …]
+     */
+    private function indexDevices(array $jobs): void {
+        if (!cacti_sizeof($jobs)) return;
+
+        $phpBin = read_config_option('path_php_binary') ?: '/usr/bin/php';
+        $worker = dirname(__DIR__) . '/cereus_datasync_index_worker.php';
+        if (!file_exists($worker)) {
+            $this->logDetail('graph_error', '', '', null, 'Index worker not found: ' . $worker);
             return;
         }
 
-        // Find the rows the check matches, using the credentials the device was saved with
-        $host = db_fetch_row_prepared('SELECT * FROM host WHERE id = ?', [$deviceId]);
-        $matched = cereus_datasync_snmp_check_walk($check, [
-            'hostname'        => $host['hostname'],
-            'community'       => $host['snmp_community'],
-            'version'         => $host['snmp_version'],
-            'username'        => $host['snmp_username'],
-            'password'        => $host['snmp_password'],
-            'auth_protocol'   => $host['snmp_auth_protocol'],
-            'priv_passphrase' => $host['snmp_priv_passphrase'],
-            'priv_protocol'   => $host['snmp_priv_protocol'],
-            'context'         => $host['snmp_context'],
-            'engine_id'       => $host['snmp_engine_id'],
-            'port'            => $host['snmp_port'],
-            'max_oids'        => $host['max_oids'],
-        ], (int)$this->profile['snmp_timeout_ms'] ?: 2000);
-
-        if (!cacti_sizeof($matched)) {
-            return; // nothing matches — normal for unreachable devices or those without this data
+        $bySite = [];
+        foreach ($jobs as $job) {
+            $d = $job['device'];
+            $bySite[($d['region'] ?? '') . '|' . ($d['country'] ?? '') . '|' . ($d['site'] ?? '')][] = $job;
         }
 
-        // A graph needs a row in the data query; the check's OID may belong to another table
-        $known = array_column(db_fetch_assoc_prepared(
-            'SELECT DISTINCT snmp_index FROM host_snmp_cache WHERE host_id = ? AND snmp_query_id = ?',
-            [$deviceId, $snmpQueryId]
-        ), 'snmp_index');
-        $indexes = array_values(array_intersect(array_unique($matched), $known));
+        $workers = !empty($this->profile['snmp_enable_parallel'])
+            ? max(1, (int)($this->profile['snmp_parallel_workers'] ?? 20))
+            : 1;
+        $workers = min($workers, count($bySite));
 
-        if (count($indexes) < count(array_unique($matched))) {
-            $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $deviceId,
-                'Check "' . $check['name'] . '": ' . (count(array_unique($matched)) - count($indexes))
-                . ' matching row(s) not found in the data query');
+        // Spread the sites over the workers, largest first.
+        uasort($bySite, function ($a, $b) { return count($b) - count($a); });
+        $chunks = array_fill(0, $workers, []);
+        foreach ($bySite as $siteJobs) {
+            $smallest = array_keys(array_map('count', $chunks), min(array_map('count', $chunks)))[0];
+            $chunks[$smallest] = array_merge($chunks[$smallest], $siteJobs);
         }
 
-        $this->stats['graphs_found'] += count($indexes);
+        $devices = [];
+        foreach ($jobs as $job) {
+            $devices[$job['host_id']] = $job['device'];
+        }
 
-        $snmpIndexOn = get_best_data_query_index_type($deviceId, $snmpQueryId);
+        $procs = [];
+        foreach ($chunks as $chunk) {
+            if (!cacti_sizeof($chunk)) continue;
 
-        foreach ($indexes as $snmpIndex) {
-            // Skip if a graph already exists for this device + template + query + index
-            $exists = db_fetch_cell_prepared(
-                'SELECT id FROM graph_local
-                 WHERE host_id = ? AND graph_template_id = ?
-                   AND snmp_query_id = ? AND snmp_index = ?',
-                [$deviceId, $templateId, $snmpQueryId, $snmpIndex]
-            );
-            if ($exists) continue;
+            $proc = proc_open(cacti_escapeshellcmd($phpBin) . ' ' . cacti_escapeshellarg($worker), [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['file', '/dev/null', 'a'],
+            ], $pipes);
+            if (!is_resource($proc)) continue;
 
-            $snmpQueryArray = [
-                'snmp_query_id'       => $snmpQueryId,
-                'snmp_index_on'       => $snmpIndexOn,
-                'snmp_query_graph_id' => $queryTypeId,
-                'snmp_index'          => $snmpIndex,
-            ];
+            fwrite($pipes[0], json_encode([
+                'prefix' => (string)($this->profile['graph_title_prefix'] ?? ''),
+                'jobs'   => array_map(function ($job) {
+                    return ['host_id' => $job['host_id'], 'queries' => $job['queries']];
+                }, $chunk),
+            ]));
+            fclose($pipes[0]);
 
-            // Isolated try/catch per graph — template.php has a bare exit() that
-            // would otherwise kill the entire background process for one bad device.
-            try {
-                $suggestedVals = [];
-                $result = create_complete_graph_from_template($templateId, $deviceId, $snmpQueryArray, $suggestedVals);
-            } catch (\Throwable $e) {
-                $this->logDetail('graph_error', $device['hostname'], $device['ip'], $deviceId,
-                    'create_graph failed index=' . $snmpIndex . ': ' . $e->getMessage());
+            $procs[] = ['proc' => $proc, 'out' => $pipes[1], 'jobs' => $chunk];
+        }
+
+        foreach ($procs as $p) {
+            $raw = stream_get_contents($p['out']);
+            fclose($p['out']);
+            proc_close($p['proc']);
+
+            $this->ensureDbConnection();
+
+            $batch = json_decode((string)$raw, true);
+            if (!is_array($batch)) {
+                foreach ($p['jobs'] as $job) {
+                    $this->logDetail('graph_error', $job['device']['hostname'] ?? '', $job['device']['ip'] ?? '', $job['host_id'],
+                        'Index worker returned no result');
+                }
                 continue;
             }
 
-            if ($result !== false) {
-                $this->stats['graphs_created']++;
-                $this->prefixGraphTitle((int)$result['local_graph_id']);
-                if (!empty($result['local_data_id'])) {
-                    foreach ($result['local_data_id'] as $dataId) {
-                        push_out_host($deviceId, $dataId);
-                    }
-                }
-                $this->logDetail('graph_created', $device['hostname'], $device['ip'], $deviceId,
-                    'graph_id=' . $result['local_graph_id'] . ' snmp_index=' . $snmpIndex);
+            foreach ($batch as $hostId => $result) {
+                $hostId = (int)$hostId;
+                $device = $devices[$hostId] ?? ['hostname' => '', 'ip' => ''];
 
-                // Cacti's tree automation places the graph while it is created;
-                // count it here, since nothing else sees that placement.
-                $this->countTreePlacement((int)$result['local_graph_id'], $device['hostname'], $device['ip'], $deviceId);
+                foreach ($result['errors'] ?? [] as $error) {
+                    $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $hostId, $error);
+                }
+
+                $this->recordRuleGraphs($hostId, $device, array_map('intval', $result['graphs'] ?? []));
             }
+
+            $this->flushStats();
+        }
+    }
+
+    private function recordRuleGraphs(int $deviceId, array $device, array $graphIds): void {
+        foreach ($graphIds as $graphId) {
+            $this->stats['graphs_found']++;
+            $this->stats['graphs_created']++;
+            $this->logDetail('graph_created', $device['hostname'], $device['ip'], $deviceId,
+                'graph_id=' . $graphId . ' (Graph Rule)');
+
+            // Cacti's tree automation places the graph while it is created;
+            // count it here, since nothing else sees that placement.
+            $this->countTreePlacement($graphId, $device['hostname'], $device['ip'], $deviceId);
         }
     }
 

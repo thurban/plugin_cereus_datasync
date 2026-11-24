@@ -56,10 +56,12 @@ A commercial [Cereus](https://urban-software.de) plugin for
   profile's recent runs. Every counter opens its log lines.
 - **SNMP naming checks** — decide which devices are added by checking any SNMP
   data: `ifAlias`, `ifDescr`, `ifName`, Cisco IP SLA tags or any numeric OID. Each
-  entry has its own text match, applies to all device functions or chosen ones, and
-  can create graphs for the rows it matches.
+  entry has its own text match (or *returns any value*) and applies to all device
+  functions or chosen ones. Checks run once, for new devices only.
+- **Graphs from Cacti's Graph Rules** — new devices are indexed once, in parallel,
+  and Cacti's Graph Rules create their graphs; existing devices are not walked.
 - **Graph title prefix** — a per-profile prefix on the title of every graph the
-  profile creates: naming check graphs, OID rule graphs and aggregate graphs.
+  profile creates: Graph Rule graphs, OID rule graphs and aggregate graphs.
 - **Co-requisite rule templates** — graph templates that share a group name are
   placed as a unit: at a location, their tree rules, branch and graph placements
   are created only when every template in the group matches at least one graph

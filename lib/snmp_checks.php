@@ -9,7 +9,17 @@ function cereus_datasync_snmp_check_operators(): array {
         3 => __('begins with', 'cereus_datasync'),
         5 => __('ends with', 'cereus_datasync'),
         7 => __('equals', 'cereus_datasync'),
+        16 => __('returns any value', 'cereus_datasync'),
     ];
+}
+
+/**
+ * Operator 16 ("returns any value", Cacti's AUTOMATION_OP_NOT_EMPTY) needs no text:
+ * the device passes when the OID returns data at all.
+ */
+function cereus_datasync_snmp_check_complete(array $check): bool {
+    return cereus_datasync_snmp_check_oid_valid((string)$check['oid'])
+        && ((int)$check['operator'] === 16 || trim((string)$check['pattern']) !== '');
 }
 
 function cereus_datasync_snmp_check_presets(): array {
@@ -32,6 +42,7 @@ function cereus_datasync_snmp_check_value_matches(string $value, int $operator, 
     $value = strtolower(trim($value));
     $text  = strtolower(trim($text));
 
+    if ($operator === 16) return $value !== '';
     if ($value === '' || $text === '') return false;
 
     switch ($operator) {
@@ -68,6 +79,29 @@ function cereus_datasync_snmp_check_walk(array $check, array $snmp, int $timeout
         'SNMP',
         $snmp['engine_id'] ?? ''
     );
+
+    // A walk below a scalar instance (….0) can come back empty; ask for the value itself.
+    if ((!is_array($rows) || !cacti_sizeof($rows)) && substr($check['oid'], -2) === '.0') {
+        $value = @cacti_snmp_get(
+            $snmp['hostname'],
+            $snmp['community'],
+            $check['oid'],
+            $snmp['version'] ?? 2,
+            $snmp['username'] ?? '',
+            $snmp['password'] ?? '',
+            $snmp['auth_protocol'] ?? '',
+            $snmp['priv_passphrase'] ?? '',
+            $snmp['priv_protocol'] ?? '',
+            $snmp['context'] ?? '',
+            $snmp['port'],
+            $timeoutMs,
+            1,
+            'SNMP',
+            $snmp['engine_id'] ?? ''
+        );
+
+        $rows = $value === false || $value === null || $value === 'U' ? [] : [['oid' => $check['oid'], 'value' => $value]];
+    }
 
     if (!is_array($rows)) return [];
 
@@ -121,35 +155,17 @@ function cereus_datasync_snmp_check_set_functions(int $checkId, int $profileId, 
     }
 }
 
-function cereus_datasync_snmp_check_add(int $profileId, string $name, string $oid, string $pattern, int $queryTypeId = 0): int {
+function cereus_datasync_snmp_check_add(int $profileId, string $name, string $oid, string $pattern): int {
     db_execute_prepared(
-        "INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern, graph_query_type_id)
-         VALUES (?, 'on', ?, ?, 1, ?, ?)",
-        [$profileId, $name, $oid, $pattern, $queryTypeId]
+        "INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern)
+         VALUES (?, 'on', ?, ?, 1, ?)",
+        [$profileId, $name, $oid, $pattern]
     );
 
     return (int)db_fetch_insert_id();
 }
 
-function cereus_datasync_query_type_options(): array {
-    $rows = db_fetch_assoc(
-        'SELECT sqg.id, CONCAT(sq.name, " — ", sqg.name) AS label
-         FROM snmp_query_graph sqg
-         JOIN snmp_query sq ON sq.id = sqg.snmp_query_id
-         ORDER BY sq.name, sqg.name'
-    );
-
-    $options = [];
-    if (cacti_sizeof($rows)) {
-        foreach ($rows as $row) {
-            $options[(int)$row['id']] = $row['label'];
-        }
-    }
-
-    return $options;
-}
-
-function cereus_datasync_render_snmp_check_row(array $check, array $queryTypes, array $funcMaps): string {
+function cereus_datasync_render_snmp_check_row(array $check, array $funcMaps): string {
     $presetOid = isset(cereus_datasync_snmp_check_presets()[$check['oid']]) ? $check['oid'] : '';
 
     $preset = '<option value="">' . html_escape(__('Custom OID', 'cereus_datasync')) . '</option>';
@@ -160,11 +176,6 @@ function cereus_datasync_render_snmp_check_row(array $check, array $queryTypes, 
     $operator = '';
     foreach (cereus_datasync_snmp_check_operators() as $code => $label) {
         $operator .= '<option value="' . $code . '"' . ($code === (int)$check['operator'] ? ' selected' : '') . '>' . html_escape($label) . '</option>';
-    }
-
-    $graph = '<option value="0">' . html_escape(__('None', 'cereus_datasync')) . '</option>';
-    foreach ($queryTypes as $id => $label) {
-        $graph .= '<option value="' . $id . '"' . ($id === (int)$check['graph_query_type_id'] ? ' selected' : '') . '>' . html_escape($label) . '</option>';
     }
 
     $linked = array_column(db_fetch_assoc_prepared(
@@ -190,8 +201,7 @@ function cereus_datasync_render_snmp_check_row(array $check, array $queryTypes, 
         . $field(__('SNMP Data', 'cereus_datasync'), '<select class="cds-check-preset">' . $preset . '</select>')
         . $field(__('OID', 'cereus_datasync'), '<input type="text" class="cds-check-oid ui-state-default ui-corner-all" maxlength="256" value="' . html_escape($check['oid']) . '">')
         . $field(__('Match', 'cereus_datasync'), '<select class="cds-check-operator">' . $operator . '</select>')
-        . $field(__('Text', 'cereus_datasync'), '<input type="text" class="cds-check-pattern ui-state-default ui-corner-all" maxlength="256" value="' . html_escape($check['pattern']) . '">')
-        . $field(__('Create Graphs', 'cereus_datasync'), '<select class="cds-check-graph">' . $graph . '</select>', 'cds-check-wide')
+        . $field(__('Text', 'cereus_datasync'), '<input type="text" class="cds-check-pattern ui-state-default ui-corner-all" maxlength="256" value="' . html_escape($check['pattern']) . '"' . ((int)$check['operator'] === 16 ? ' disabled' : '') . '>')
         . '<label class="cds-check-enabled"><input type="checkbox" class="cds-check-on"' . ($check['enabled'] === 'on' ? ' checked' : '') . '> ' . html_escape(__('Enabled', 'cereus_datasync')) . '</label>'
         . '<button type="button" class="ui-button cds-check-del" title="' . html_escape(__('Delete', 'cereus_datasync')) . '">&#128465;</button>'
         . '<div class="cds-check-scope">'

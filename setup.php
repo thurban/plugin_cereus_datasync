@@ -25,6 +25,7 @@ function plugin_cereus_datasync_uninstall() {
     db_execute('DROP TABLE IF EXISTS plugin_cds_agg_conditions');
     db_execute('DROP TABLE IF EXISTS plugin_cds_aggregate_rules');
     db_execute('DROP TABLE IF EXISTS plugin_cds_oid_rules');
+    db_execute('DROP TABLE IF EXISTS plugin_cds_dq_indexed');
     db_execute('DROP TABLE IF EXISTS plugin_cds_snmp_check_functions');
     db_execute('DROP TABLE IF EXISTS plugin_cds_snmp_checks');
     db_execute('DROP TABLE IF EXISTS plugin_cds_function_maps');
@@ -615,6 +616,18 @@ function cereus_datasync_setup_tables() {
             WHERE c.id IS NULL");
     }
 
+    // Graphs come from Cacti's Graph Rules now: turn each check's graph type into one.
+    cereus_datasync_migrate_check_graphs();
+
+    // The data queries each device was indexed for, so a device is walked once per
+    // data query even when the walk finds nothing (e.g. no IP SLA entries).
+    db_execute("CREATE TABLE IF NOT EXISTS plugin_cds_dq_indexed (
+        host_id       MEDIUMINT UNSIGNED NOT NULL,
+        snmp_query_id MEDIUMINT UNSIGNED NOT NULL,
+        indexed_at    TIMESTAMP          NULL DEFAULT NULL,
+        PRIMARY KEY (host_id, snmp_query_id)
+    ) $charset");
+
     // Migration: a title prefix for the graphs a profile creates
     if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_profiles LIKE 'graph_title_prefix'"))) {
         db_execute("ALTER TABLE plugin_cds_profiles
@@ -641,4 +654,87 @@ function cereus_datasync_setup_tables() {
             ADD COLUMN sites_unmarked INT UNSIGNED NOT NULL DEFAULT 0 AFTER empty_trees_marked,
             ADD COLUMN trees_unmarked INT UNSIGNED NOT NULL DEFAULT 0 AFTER sites_unmarked");
     }
+}
+
+/**
+ * Before 1.12.0 each SNMP naming check could create graphs itself, which walked
+ * every device on every run. Each check's graph type becomes a Cacti Graph Rule:
+ * the check's data query and graph type, the check's text as the graph creation
+ * criterion on the matching data query field, and the host templates of the
+ * check's device functions as the matching devices. Then the column goes.
+ */
+function cereus_datasync_migrate_check_graphs() {
+    global $config;
+
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_snmp_checks LIKE 'graph_query_type_id'"))) {
+        return;
+    }
+
+    include_once $config['base_path'] . '/lib/data_query.php';
+
+    $checks = db_fetch_assoc('SELECT c.*, p.name AS profile_name, sqg.snmp_query_id, sqg.graph_template_id
+        FROM plugin_cds_snmp_checks AS c
+        INNER JOIN plugin_cds_profiles AS p ON p.id = c.profile_id
+        INNER JOIN snmp_query_graph AS sqg ON sqg.id = c.graph_query_type_id
+        WHERE c.graph_query_type_id > 0
+        ORDER BY c.id');
+
+    foreach ($checks as $check) {
+        $name = substr('Data Sync: ' . $check['profile_name'] . ' - ' . $check['name'], 0, 255);
+
+        // Page requests can run the upgrade concurrently.
+        if (db_fetch_cell_prepared('SELECT id FROM automation_graph_rules WHERE name = ?', [$name])) {
+            continue;
+        }
+
+        // The data query field read from the check's OID, if the query has one.
+        $field = '';
+        $dq    = @get_data_query_array((int)$check['snmp_query_id']);
+        if (is_array($dq) && isset($dq['fields'])) {
+            foreach ($dq['fields'] as $fieldName => $def) {
+                if (trim((string)($def['oid'] ?? ''), '.') === trim((string)$check['oid'], '.')
+                    && in_array($def['direction'] ?? '', ['input', 'input-output'], true)) {
+                    $field = (string)$fieldName;
+                    break;
+                }
+            }
+        }
+
+        $templates = array_column(db_fetch_assoc_prepared(
+            !empty($check['all_functions'])
+                ? "SELECT DISTINCT host_template_id FROM plugin_cds_function_maps
+                   WHERE profile_id = ? AND enabled = 'on' AND host_template_id > 0"
+                : "SELECT DISTINCT m.host_template_id FROM plugin_cds_function_maps AS m
+                   INNER JOIN plugin_cds_snmp_check_functions AS l ON l.function_map_id = m.id
+                   WHERE m.profile_id = ? AND l.check_id = ? AND m.enabled = 'on' AND m.host_template_id > 0",
+            !empty($check['all_functions']) ? [(int)$check['profile_id']] : [(int)$check['profile_id'], (int)$check['id']]
+        ), 'host_template_id');
+
+        $enabled = $field !== '' && cacti_sizeof($templates) && $check['enabled'] === 'on';
+
+        db_execute_prepared('INSERT INTO automation_graph_rules (name, snmp_query_id, graph_type_id, enabled) VALUES (?, ?, ?, ?)',
+            [$name, (int)$check['snmp_query_id'], (int)$check['graph_query_type_id'], $enabled ? 'on' : '']);
+        $ruleId = (int)db_fetch_insert_id();
+        if (!$ruleId) continue;
+
+        if ($field !== '') {
+            db_execute_prepared('INSERT INTO automation_graph_rule_items (rule_id, sequence, operation, field, operator, pattern)
+                VALUES (?, 1, 0, ?, ?, ?)',
+                [$ruleId, $field, (int)$check['operator'], (int)$check['operator'] === 16 ? '' : $check['pattern']]);
+        }
+
+        $seq = 0;
+        foreach ($templates as $templateId) {
+            $seq++;
+            db_execute_prepared('INSERT INTO automation_match_rule_items (rule_id, rule_type, sequence, operation, field, operator, pattern)
+                VALUES (?, 1, ?, ?, \'h.host_template_id\', 7, ?)',
+                [$ruleId, $seq, $seq === 1 ? 0 : 2, (string)$templateId]);
+        }
+
+        cacti_log('cereus_datasync: SNMP check "' . $check['name'] . '" now creates its graphs through Graph Rule "' . $name . '"'
+            . ($enabled ? '' : ' (left disabled: ' . ($field === '' ? 'the data query has no field for OID ' . $check['oid'] : ($check['enabled'] !== 'on' ? 'the check is disabled' : 'no host template to match')) . ')'),
+            false, 'CEREUS_DATASYNC');
+    }
+
+    db_execute('ALTER TABLE plugin_cds_snmp_checks DROP COLUMN graph_query_type_id');
 }

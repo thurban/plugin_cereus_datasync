@@ -223,7 +223,7 @@ switch ($action) {
 
         $checkId = cereus_datasync_snmp_check_add($pid, __('New check', 'cereus_datasync'), '.1.3.6.1.2.1.31.1.1.1.18', '');
         $check   = db_fetch_row_prepared('SELECT * FROM plugin_cds_snmp_checks WHERE id = ?', [$checkId]);
-        print json_encode(['id' => $checkId, 'html' => cereus_datasync_render_snmp_check_row($check, cereus_datasync_query_type_options(), cereus_datasync_get_function_maps($pid))]);
+        print json_encode(['id' => $checkId, 'html' => cereus_datasync_render_snmp_check_row($check, cereus_datasync_get_function_maps($pid))]);
         break;
     }
 
@@ -251,15 +251,14 @@ switch ($action) {
 
         db_execute_prepared(
             'UPDATE plugin_cds_snmp_checks
-             SET enabled = ?, name = ?, oid = ?, operator = ?, pattern = ?, graph_query_type_id = ?, all_functions = ?
+             SET enabled = ?, name = ?, oid = ?, operator = ?, pattern = ?, all_functions = ?
              WHERE id = ? AND profile_id = ?',
             [
                 get_nfilter_request_var('enabled', '') === 'on' ? 'on' : '',
                 substr(trim(get_nfilter_request_var('name', '')), 0, 128),
                 substr($oid, 0, 256),
                 $operator,
-                substr(trim(get_nfilter_request_var('pattern', '')), 0, 256),
-                (int)get_nfilter_request_var('graph_query_type_id', '0'),
+                $operator === 16 ? '' : substr(trim(get_nfilter_request_var('pattern', '')), 0, 256),
                 get_nfilter_request_var('all_functions', '1') === '1' ? 1 : 0,
                 $checkId, $pid,
             ]

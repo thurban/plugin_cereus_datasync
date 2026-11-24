@@ -5,6 +5,32 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-11-24
+
+### Changed
+- **Graphs come from Cacti's Graph Rules; imports are fast again.** Since 1.11.0
+  every run walked each existing device for every naming check it had no graph
+  from yet, one device at a time, so devices that never match (no IP SLA entries,
+  unreachable) were walked on every run. The naming checks now only decide, once,
+  whether a new device is added. A new device's data queries that have an enabled
+  Graph Rule are indexed once, in parallel workers, and Cacti creates the graphs
+  from its Graph Rules. Devices already in Cacti are not walked by a sync.
+- **Upgrade: each check's *Create Graphs* becomes a Graph Rule** named
+  "Data Sync: <profile> - <check>", with the check's text on the matching data
+  query field and the host templates of the check's device functions as matching
+  devices. A rule whose OID has no field in the data query is created disabled and
+  logged. The *Create Graphs* option is gone from the checks.
+- *Auto-create Graphs* is now *Run Graph Rules*. *Apply Rules* runs the Graph Rules
+  for existing devices from Cacti's cached index data; a data query a device was
+  never indexed for is walked once.
+- New devices get Cacti's default re-index method instead of *None*, so Cacti
+  re-indexes them itself and its Graph Rules pick up new interfaces later.
+
+### Added
+- **"returns any value" match** for naming checks: a device passes when the OID
+  returns data at all, no text needed. An empty walk below a `.0` OID is retried
+  as an SNMP get.
+
 ## [1.11.0] - 2026-11-03
 
 ### Added

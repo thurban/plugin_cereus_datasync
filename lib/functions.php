@@ -122,9 +122,9 @@ function cereus_datasync_copy_profile(int $id): int {
     if (cacti_sizeof($checks)) {
         foreach ($checks as $c) {
             db_execute_prepared(
-                'INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern, graph_query_type_id, all_functions)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                [$newId, $c['enabled'], $c['name'], $c['oid'], (int)$c['operator'], $c['pattern'], (int)$c['graph_query_type_id'], (int)$c['all_functions']]
+                'INSERT INTO plugin_cds_snmp_checks (profile_id, enabled, name, oid, operator, pattern, all_functions)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [$newId, $c['enabled'], $c['name'], $c['oid'], (int)$c['operator'], $c['pattern'], (int)$c['all_functions']]
             );
             $newCheckId = (int)db_fetch_insert_id();
 

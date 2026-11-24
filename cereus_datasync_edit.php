@@ -132,6 +132,8 @@ function cereus_datasync_save(): void {
 // ─── Edit form ───────────────────────────────────────────────────────────────
 
 function cereus_datasync_edit_form(int $id): void {
+    global $config;
+
     $row     = $id ? cereus_datasync_get_profile($id) : [];
     $colMaps = $id ? cereus_datasync_get_column_maps($id) : [];
     $funcMaps = $id ? cereus_datasync_get_function_maps($id) : [];
@@ -278,14 +280,13 @@ function cereus_datasync_edit_form(int $id): void {
     // ── SNMP Naming Checks ────────────────────────────────────────────────
     html_start_box(__('SNMP Naming Checks', 'cereus_datasync'), '100%', '', '3', 'center', '');
     print '<tr class="even"><td style="padding:10px 15px;">';
-    print '<p style="margin:0 0 6px;font-size:12px;color:#666;">' . __('Each entry names SNMP data to walk and the text to look for, for all device functions or only the ones you choose. A device whose function has SNMP Check ticked is added when any enabled entry for that function matches; with no complete entry for it, the device is skipped. Choosing a graph type creates a graph for each matching row when Auto-create Graphs is on; the type must be a data query whose index is the number after the OID.', 'cereus_datasync') . '</p>';
+    print '<p style="margin:0 0 6px;font-size:12px;color:#666;">' . __('Each entry names SNMP data to walk and the text to look for, for all device functions or only the ones you choose. A device whose function has SNMP Check ticked is added when any enabled entry for that function matches; with no complete entry for it, the device is skipped. Use "returns any value" to add a device when the OID returns data at all. The checks only run once, for devices not yet in Cacti; graphs come from Cacti\'s Graph Rules.', 'cereus_datasync') . '</p>';
     if ($id) {
-        $queryTypes = cereus_datasync_query_type_options();
         print '<div id="cds-check-list">';
         $checks = db_fetch_assoc_prepared('SELECT * FROM plugin_cds_snmp_checks WHERE profile_id = ? ORDER BY id', [$id]);
         if (cacti_sizeof($checks)) {
             foreach ($checks as $check) {
-                print cereus_datasync_render_snmp_check_row($check, $queryTypes, $funcMaps);
+                print cereus_datasync_render_snmp_check_row($check, $funcMaps);
             }
         }
         print '</div>';
@@ -457,21 +458,21 @@ function cereus_datasync_edit_form(int $id): void {
     html_end_box();
 
     // ── Graph Creation & Automation Rules ────────────────────────────────
-    // Build query type dropdown: "SNMP - Interface Statistics — In/Out Bits"
     html_start_box(__('Graph Creation & Tree Automation', 'cereus_datasync'), '100%', '', '3', 'center', '');
     print '<tr><td colspan="2" style="padding:6px 15px;background:#f0f9ff;border-bottom:1px solid #bae6fd;font-size:12px;color:#0369a1;">';
-    print __('When a new device is added, the sync can immediately create graphs from the SNMP Naming Checks above: one graph per matching row, for each entry with a graph type that applies to its device function. Cacti\'s automation rules (configured on the Rules page) then fire automatically to place those graphs in the correct tree leaf.', 'cereus_datasync');
+    print __('Graphs are created by Cacti\'s Graph Rules (Console &gt; Automation &gt; Graph Rules), e.g. "In/Out Bits where ifAlias contains -WAN-". When a new device is added, the sync indexes the device\'s data queries that have an enabled Graph Rule once, in parallel; Cacti then creates the graphs from the rules and its tree rules place them. Devices already in Cacti are not walked again; Cacti re-indexes them itself.', 'cereus_datasync');
+    print ' <a class="linkEditMain" href="' . html_escape($config['url_path'] . 'automation_graph_rules.php') . '">' . __('Open Graph Rules', 'cereus_datasync') . '</a>';
     print '</td></tr>';
     draw_edit_form(['config' => ['no_form_tag' => true], 'fields' => [
         'auto_create_graphs' => [
-            'friendly_name' => __('Auto-create Graphs', 'cereus_datasync'),
-            'description'   => __('After a device is added, create a graph for each row matched by an SNMP Naming Check that applies to its device function and has a graph type.', 'cereus_datasync'),
+            'friendly_name' => __('Run Graph Rules', 'cereus_datasync'),
+            'description'   => __('After a device is added, index its data queries that have an enabled Graph Rule, so Cacti creates the graphs. Apply Rules also runs the Graph Rules for devices already in Cacti, from their cached index data; a data query is walked there only if the device was never indexed for it.', 'cereus_datasync'),
             'method'        => 'checkbox',
             'value'         => !empty($r['auto_create_graphs']) ? 'on' : '',
         ],
         'graph_title_prefix' => [
             'friendly_name' => __('Graph Title Prefix', 'cereus_datasync'),
-            'description'   => __('Text put in front of the title of every graph this profile creates: naming check graphs, OID rule graphs and aggregate graphs. Include your own separator, e.g. "NET - ". Existing graphs keep their title, except aggregate graphs, whose title is rebuilt on every run.', 'cereus_datasync'),
+            'description'   => __('Text put in front of the title of every graph this profile creates: Graph Rule graphs of the devices it adds or applies rules to, OID rule graphs and aggregate graphs. Include your own separator, e.g. "NET - ". Existing graphs keep their title, except aggregate graphs, whose title is rebuilt on every run.', 'cereus_datasync'),
             'method'        => 'textbox',
             'value'         => $r['graph_title_prefix'] ?? '',
             'max_length'    => 64,
@@ -600,6 +601,7 @@ function cereus_datasync_edit_form(int $id): void {
                 var oid = row.find('.cds-check-oid').val();
 
                 cdsShowCheckScope(row);
+                row.find('.cds-check-pattern').prop('disabled', row.find('.cds-check-operator').val() === '16');
 
                 if ($(this).hasClass('cds-check-oid')) {
                     var preset = row.find('.cds-check-preset');
@@ -662,7 +664,6 @@ function cereus_datasync_edit_form(int $id): void {
                 oid: row.find('.cds-check-oid').val(),
                 operator: row.find('.cds-check-operator').val(),
                 pattern: row.find('.cds-check-pattern').val(),
-                graph_query_type_id: row.find('.cds-check-graph').val(),
                 all_functions: row.find('.cds-check-all').is(':checked') ? 1 : 0,
                 functions: row.find('.cds-check-func-list input:checked').map(function() { return this.value; }).get().join(','),
                 __csrf_magic: csrfMagicToken

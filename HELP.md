@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.11.0.
+one. This guide covers version 1.12.0.
 
 ---
 
@@ -131,24 +131,26 @@ the profile list. You can keep several — one per region or customer, for examp
 |---|---|
 | Name | Shown in the run log, so you can see why a device was added or skipped |
 | SNMP Data / OID | What to walk. Pick *ifAlias*, *ifDescr*, *ifName* or *Cisco IP SLA tag*, or type any numeric OID |
-| Match / Text | *contains*, *begins with*, *ends with* or *equals*; not case-sensitive |
-| Create Graphs | Optional data query and graph type; needs *Auto-create Graphs* |
+| Match / Text | *contains*, *begins with*, *ends with* or *equals*; not case-sensitive. *returns any value* needs no text: the device passes when the OID returns data at all |
 | Device Functions | *All device functions*, or only the functions you tick |
 
 - A device passes when **any** enabled entry for its function matches, on any row of
   the walked data.
-- An entry with no text is ignored. If no complete entry is left for its function, a
-  device with *SNMP Check* ticked is skipped, and the log says why.
-- *Device Functions* also limits *Create Graphs*. A function without *SNMP Check* is
-  added without a check, but still gets graphs from the entries that apply to it.
+- An entry with no text is ignored, unless it uses *returns any value*. If no complete
+  entry is left for its function, a device with *SNMP Check* ticked is skipped, and
+  the log says why.
+- The checks run once, for devices not yet in Cacti, and only decide whether a device
+  is added. Devices already in Cacti are never walked by a sync. Graphs come from
+  Cacti's Graph Rules (see *Run Graph Rules* below).
+- Example: one entry *returns any value* on a vendor OID for firewalls, and one
+  entry *ifAlias contains -WAN-* for routers, each limited to its device function.
 - An entry limited to chosen functions with none left, for example after deleting
   the mapping, is not used.
 - An unreachable device matches nothing, so it is skipped too.
 - Checks walk with the SNMP community from the file (or the profile default), using
   SNMP v2c and the profile's SNMP port.
-- *Create Graphs* makes one graph per matching row. The number after the OID has to
-  be the data query's index, as with `ifAlias` and the *SNMP - Interface Statistics*
-  query. A match the query does not know is logged as *Graphs skipped*.
+- A walk below a single value (an OID ending in `.0`, e.g. `sysObjectID.0`) that
+  comes back empty is retried as a plain SNMP get.
 
 ### What happens to removed devices, and what gets created
 
@@ -158,13 +160,20 @@ the profile list. You can keep several — one per region or customer, for examp
    the file. Devices are never deleted automatically.
 2. **Flag Empty Sites** / **Flag Empty Tree Branches** — tag sites and branches left
    without devices ([section 10](#10-cleaning-up-empty-sites-and-branches)).
-3. **Auto-create Graphs** — create graphs from the SNMP Naming Checks that have a
-   graph type: for a new device straight away, and on every later run for an existing
-   device that has no graph of that check's graph type yet (for example a check added
-   after the device). A device with at least one such graph is not walked again.
+3. **Run Graph Rules** — graphs are created by Cacti's own **Graph Rules**
+   (*Console > Automation > Graph Rules*), e.g. *In/Out Bits where ifAlias contains
+   -WAN-*. After a sync adds devices, it indexes each new device's data queries that
+   have an enabled Graph Rule — once, in parallel worker processes. Cacti then creates
+   the graphs from the rules, and its tree rules place them. New devices get Cacti's
+   default re-index method, so Cacti re-indexes them itself later (e.g. after a
+   reboot) and the Graph Rules pick up new interfaces or IP SLA entries.
+   *Apply Rules* also runs the Graph Rules for devices already in Cacti, from the
+   index data Cacti already holds — no SNMP. A data query is walked there only if the
+   device was never indexed for it, and then only once.
 4. **Graph Title Prefix** — text put in front of the title of every graph the profile
-   creates: naming check graphs, OID rule graphs and aggregate graphs. Include your own
-   separator, e.g. `NET - `. See the notes below.
+   creates: Graph Rule graphs of the devices it adds or applies rules to, OID rule
+   graphs and aggregate graphs. Include your own separator, e.g. `NET - `. See the
+   notes below.
 5. **Enable Auto Tree Rules** — turn on the tree rules of
    [section 7](#7-tree-placement-rules).
 
@@ -204,9 +213,8 @@ rule, or when graphs got new titles.
   from the site name the sync wrote (`region/country/site`).
 - Graphs that **already exist** and match a template are placed straight away.
 - Host rules, aggregate rules, OID rules and co-requisite groups are applied as well.
-- With *Auto-create Graphs* on, devices with no graph from an SNMP Naming Check yet
-  get that check's graphs. The check's device functions are found from the device's
-  host template through the function mappings.
+- With *Run Graph Rules* on, Cacti's Graph Rules are run for every device, from the
+  index data Cacti already holds. Use this after adding a Graph Rule.
 - The run appears in the log as *(rules only)* and does not change the profile's
   *Last Run* or its schedule.
 

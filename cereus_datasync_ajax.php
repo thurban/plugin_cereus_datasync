@@ -162,8 +162,10 @@ switch ($action) {
                 'tree_placed'        => (int)$run['tree_placed'],
                 'graphs_found'       => (int)$run['graphs_found'],
                 'graphs_created'     => (int)$run['graphs_created'],
-                'checking'           => (int)($run['checking'] ?? 0),
             ],
+            'phase'          => (string)($run['phase'] ?? ''),
+            'progress_done'  => (int)($run['progress_done'] ?? 0),
+            'progress_total' => (int)($run['progress_total'] ?? 0),
             'details' => cereus_datasync_run_action_counts($runId),
             'error'  => $run['error_message'] ?: null,
         ]);

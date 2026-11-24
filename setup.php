@@ -648,6 +648,14 @@ function cereus_datasync_setup_tables() {
             ADD COLUMN empty_trees_marked INT UNSIGNED NOT NULL DEFAULT 0 AFTER empty_sites_marked");
     }
 
+    // Migration: live progress of a run (phase, done / total), shown while it runs
+    if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_runs LIKE 'phase'"))) {
+        db_execute("ALTER TABLE plugin_cds_runs
+            ADD COLUMN phase          VARCHAR(64)  NOT NULL DEFAULT '' AFTER status,
+            ADD COLUMN progress_done  INT UNSIGNED NOT NULL DEFAULT 0 AFTER phase,
+            ADD COLUMN progress_total INT UNSIGNED NOT NULL DEFAULT 0 AFTER progress_done");
+    }
+
     // Migration: add tag-reconciliation (un-mark) run counters to existing installs
     if (!cacti_sizeof(db_fetch_assoc("SHOW COLUMNS FROM plugin_cds_runs LIKE 'sites_unmarked'"))) {
         db_execute("ALTER TABLE plugin_cds_runs

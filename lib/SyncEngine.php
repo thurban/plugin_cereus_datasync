@@ -37,8 +37,11 @@ class CereusDatasyncEngine {
         'graphs_found'       => 0, 'graphs_created'      => 0,
         'empty_sites_marked' => 0, 'empty_trees_marked'  => 0,
         'sites_unmarked'     => 0, 'trees_unmarked'      => 0,
-        'checking'           => 0, // devices pending SNMP interface name check
     ];
+    private string $phase      = '';   // what the run is doing now, shown while it runs
+    private int    $progress   = 0;    // items of the phase done
+    private int    $progressOf = 0;    // items in the phase
+    private float  $lastFlush  = 0.0;
 
     // ─── Public API ──────────────────────────────────────────────────────────
 
@@ -230,8 +233,7 @@ class CereusDatasyncEngine {
 
             // ── SNMP naming checks ────────────────────────────────────
             if (!empty($l2check) && !$this->dryRun) {
-                $this->stats['checking'] = count($l2check);
-                $this->flushStats();
+                $this->setPhase('SNMP naming checks', count($l2check));
 
                 // Use proc_open() workers for parallelism — each is a clean PHP
                 // process with no inherited DB connection, so the parent's MySQL
@@ -244,9 +246,7 @@ class CereusDatasyncEngine {
                         $key    = $dev['hostname'] ?? $dev['ip'] ?? '';
                         $matched = $snmpResults[$key]['matched'] ?? null;
                         $toAdd[] = ['device' => $dev, 'passed' => $matched !== null, 'matched' => $matched];
-                        $this->stats['checking']--;
                     }
-                    $this->flushStats();
                 } else {
                     foreach ($l2check as $dev) {
                         $matched = cereus_datasync_snmp_check_device($this->checksForDevice($dev), [
@@ -255,10 +255,10 @@ class CereusDatasyncEngine {
                             'port'      => (int)$this->profile['default_snmp_port'],
                         ], (int)$this->profile['snmp_timeout_ms'] ?: 2000);
                         $toAdd[] = ['device' => $dev, 'passed' => $matched !== null, 'matched' => $matched];
-                        $this->stats['checking']--;
-                        $this->flushStats();
+                        $this->logCheckResult($dev, $matched);
                     }
                 }
+                $this->setPhase('');
             } elseif (!empty($l2check)) {
                 // Dry run — no SNMP, so the naming checks cannot run: count the
                 // device as an add, but say it still depends on that check. With no
@@ -356,6 +356,7 @@ class CereusDatasyncEngine {
             if (!$this->dryRun && !empty($this->profile['auto_create_graphs']) && cacti_sizeof($added)) {
                 $jobs = [];
                 foreach ($added as $a) {
+                    $this->linkRuleQueries($a['id'], $a['device']);
                     $queries = $this->ruledQueries($a['id']);
                     if (cacti_sizeof($queries)) {
                         $jobs[] = ['host_id' => $a['id'], 'queries' => $queries, 'device' => $a['device']];
@@ -1126,6 +1127,59 @@ class CereusDatasyncEngine {
 
     // ─── Graphs from Cacti's Graph Rules ─────────────────────────────────────
 
+    private ?array $graphRuleFilters = null;   // enabled Graph Rules: [snmp_query_id, matching-devices SQL]
+
+    /**
+     * Cacti runs a Graph Rule only for a data query linked to the device, and the
+     * host template may not have it (e.g. IP SLA). Link the data query of every
+     * enabled Graph Rule whose matching-devices criteria fit this device, with
+     * Cacti's default re-index method. Linking needs no SNMP; the walk follows in
+     * indexDevices(), once.
+     */
+    private function linkRuleQueries(int $deviceId, array $device): void {
+        global $config;
+
+        if ($this->graphRuleFilters === null) {
+            include_once $config['base_path'] . '/lib/api_automation.php';
+            include_once $config['base_path'] . '/lib/api_device.php';
+
+            $this->graphRuleFilters = [];
+            $rules = db_fetch_assoc("SELECT id, name, snmp_query_id FROM automation_graph_rules WHERE enabled = 'on' ORDER BY id");
+            foreach ($rules as $rule) {
+                $this->graphRuleFilters[] = [
+                    'name'   => $rule['name'],
+                    'query'  => (int)$rule['snmp_query_id'],
+                    // The same matching-devices SQL Cacti builds for the rule.
+                    'filter' => build_matching_objects_filter((int)$rule['id'], AUTOMATION_RULE_TYPE_GRAPH_MATCH),
+                ];
+            }
+        }
+
+        if (!cacti_sizeof($this->graphRuleFilters)) return;
+
+        $linked = array_map('intval', array_column(db_fetch_assoc_prepared(
+            'SELECT snmp_query_id FROM host_snmp_query WHERE host_id = ?', [$deviceId]
+        ), 'snmp_query_id'));
+
+        foreach ($this->graphRuleFilters as $rule) {
+            if (in_array($rule['query'], $linked, true)) continue;
+
+            $match = db_fetch_cell_prepared('SELECT h.id
+                FROM host AS h
+                LEFT JOIN host_template AS ht ON h.host_template_id = ht.id
+                WHERE (' . $rule['filter'] . ') AND h.id = ? AND h.deleted = ""',
+                [$deviceId]);
+            if (!$match) continue;
+
+            api_device_dq_add($deviceId, $rule['query'], (int)read_config_option('reindex_method'));
+            $linked[] = $rule['query'];
+
+            $this->logDetail('dq_linked', $device['hostname'] ?? '', $device['ip'] ?? '', $deviceId,
+                'Data query "' . db_fetch_cell_prepared('SELECT name FROM snmp_query WHERE id = ?', [$rule['query']])
+                . '" linked for Graph Rule "' . $rule['name'] . '"');
+        }
+    }
+
     // The device's data queries that an enabled Graph Rule creates graphs from.
     private function ruledQueries(int $deviceId): array {
         return array_map('intval', array_column(db_fetch_assoc_prepared(
@@ -1153,10 +1207,14 @@ class CereusDatasyncEngine {
         }
 
         $jobs = [];
+        $this->setPhase('Graph Rules for devices in Cacti', count($devices));
         foreach ($devices as $device) {
+            $this->progress++;
+            $this->flushStats(false);
             if (($device['disabled'] ?? '') === 'on') continue;
 
             $deviceId = (int)$device['id'];
+            $this->linkRuleQueries($deviceId, $device);
             $queries  = $this->ruledQueries($deviceId);
             if (!cacti_sizeof($queries)) continue;
 
@@ -1193,7 +1251,7 @@ class CereusDatasyncEngine {
             }
         }
 
-        $this->flushStats();
+        $this->setPhase('');
         $this->indexDevices($jobs);
     }
 
@@ -1208,12 +1266,7 @@ class CereusDatasyncEngine {
     private function indexDevices(array $jobs): void {
         if (!cacti_sizeof($jobs)) return;
 
-        $phpBin = read_config_option('path_php_binary') ?: '/usr/bin/php';
         $worker = dirname(__DIR__) . '/cereus_datasync_index_worker.php';
-        if (!file_exists($worker)) {
-            $this->logDetail('graph_error', '', '', null, 'Index worker not found: ' . $worker);
-            return;
-        }
 
         $bySite = [];
         foreach ($jobs as $job) {
@@ -1239,57 +1292,40 @@ class CereusDatasyncEngine {
             $devices[$job['host_id']] = $job['device'];
         }
 
-        $procs = [];
+        $payloads = [];
         foreach ($chunks as $chunk) {
             if (!cacti_sizeof($chunk)) continue;
-
-            $proc = proc_open(cacti_escapeshellcmd($phpBin) . ' ' . cacti_escapeshellarg($worker), [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['file', '/dev/null', 'a'],
-            ], $pipes);
-            if (!is_resource($proc)) continue;
-
-            fwrite($pipes[0], json_encode([
+            $payloads[] = json_encode([
                 'prefix' => (string)($this->profile['graph_title_prefix'] ?? ''),
                 'jobs'   => array_map(function ($job) {
                     return ['host_id' => $job['host_id'], 'queries' => $job['queries']];
                 }, $chunk),
-            ]));
-            fclose($pipes[0]);
-
-            $procs[] = ['proc' => $proc, 'out' => $pipes[1], 'jobs' => $chunk];
+            ]);
         }
 
-        foreach ($procs as $p) {
-            $raw = stream_get_contents($p['out']);
-            fclose($p['out']);
-            proc_close($p['proc']);
+        $this->setPhase($this->rulesOnly ? 'Indexing devices for Graph Rules' : 'Indexing new devices for Graph Rules', count($jobs));
 
-            $this->ensureDbConnection();
+        $seen = [];
+        $this->runWorkers($worker, [], $payloads, function (array $result) use ($devices, &$seen) {
+            $hostId = (int)($result['host_id'] ?? 0);
+            $device = $devices[$hostId] ?? ['hostname' => '', 'ip' => ''];
+            $seen[$hostId] = true;
 
-            $batch = json_decode((string)$raw, true);
-            if (!is_array($batch)) {
-                foreach ($p['jobs'] as $job) {
-                    $this->logDetail('graph_error', $job['device']['hostname'] ?? '', $job['device']['ip'] ?? '', $job['host_id'],
-                        'Index worker returned no result');
-                }
-                continue;
+            foreach ($result['errors'] ?? [] as $error) {
+                $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $hostId, $error);
             }
 
-            foreach ($batch as $hostId => $result) {
-                $hostId = (int)$hostId;
-                $device = $devices[$hostId] ?? ['hostname' => '', 'ip' => ''];
+            $this->recordRuleGraphs($hostId, $device, array_map('intval', $result['graphs'] ?? []));
+            $this->progress++;
+            $this->flushStats(false);
+        });
 
-                foreach ($result['errors'] ?? [] as $error) {
-                    $this->logDetail('graph_skip', $device['hostname'], $device['ip'], $hostId, $error);
-                }
-
-                $this->recordRuleGraphs($hostId, $device, array_map('intval', $result['graphs'] ?? []));
-            }
-
-            $this->flushStats();
+        foreach (array_diff_key($devices, $seen) as $hostId => $device) {
+            $this->logDetail('graph_error', $device['hostname'] ?? '', $device['ip'] ?? '', (int)$hostId,
+                'Index worker returned no result');
         }
+
+        $this->setPhase('');
     }
 
     private function recordRuleGraphs(int $deviceId, array $device, array $graphIds): void {
@@ -2927,16 +2963,8 @@ class CereusDatasyncEngine {
     // sequentially for good SNMP connection reuse.
 
     private function checkL2Parallel(array $devices): array {
-        global $config;
-
-        $phpBin     = read_config_option('path_php_binary') ?: '/usr/bin/php';
-        $worker     = dirname(__DIR__) . '/cereus_datasync_snmp_worker.php';
-        $timeoutMs  = (int)$this->profile['snmp_timeout_ms'] ?: 2000;
-
-        if (!file_exists($worker)) {
-            cacti_log('cereus_datasync: SNMP worker script not found, falling back to sequential', false, 'SYSTEM');
-            return [];
-        }
+        $worker    = dirname(__DIR__) . '/cereus_datasync_snmp_worker.php';
+        $timeoutMs = (int)$this->profile['snmp_timeout_ms'] ?: 2000;
 
         $maxWorkers = min(
             max(1, (int)($this->profile['snmp_parallel_workers'] ?? 20)),
@@ -2944,41 +2972,104 @@ class CereusDatasyncEngine {
         );
         $chunks = array_chunk($devices, (int)ceil(count($devices) / $maxWorkers));
 
-        $cmd = escapeshellcmd($phpBin) . ' '
-             . escapeshellarg($worker) . ' '
-             . (int)$timeoutMs . ' '
-             . (int)$this->profile['default_snmp_port'];
-
-        // Launch all workers concurrently
-        $procs = [];
-        foreach ($chunks as $chunk) {
-            $desc = [
-                0 => ['pipe', 'r'],   // stdin  — we write the device batch
-                1 => ['pipe', 'w'],   // stdout — worker writes JSON results
-                2 => ['file', '/dev/null', 'a'],
-            ];
-            $proc = proc_open($cmd, $desc, $pipes);
-            if (!is_resource($proc)) continue;
-
-            fwrite($pipes[0], json_encode(['checks' => $this->snmpChecks, 'devices' => $chunk]));
-            fclose($pipes[0]);
-
-            $procs[] = ['proc' => $proc, 'out' => $pipes[1]];
+        $byKey = [];
+        foreach ($devices as $dev) {
+            $byKey[$dev['hostname'] ?? $dev['ip'] ?? ''] = $dev;
         }
 
-        // Collect results — stream_get_contents blocks per-worker until it exits
-        $results = [];
-        foreach ($procs as $p) {
-            $raw = stream_get_contents($p['out']);
-            fclose($p['out']);
-            proc_close($p['proc']);
-            $batch = json_decode($raw, true);
-            if (is_array($batch)) {
-                $results = array_merge($results, $batch);
+        $results  = [];
+        $payloads = [];
+        foreach ($chunks as $chunk) {
+            $payloads[] = json_encode(['checks' => $this->snmpChecks, 'devices' => $chunk]);
+        }
+
+        $this->runWorkers($worker, [(string)$timeoutMs, (string)(int)$this->profile['default_snmp_port']], $payloads,
+            function (array $line) use (&$results, $byKey) {
+                $key = (string)($line['key'] ?? '');
+                $results[$key] = ['matched' => $line['matched'] ?? null];
+                $this->logCheckResult($byKey[$key] ?? ['hostname' => $key, 'ip' => ''], $line['matched'] ?? null);
+            });
+
+        return $results;
+    }
+
+    private function logCheckResult(array $dev, ?string $matched): void {
+        if ($matched !== null) {
+            $this->logDetail('snmp_pass', $dev['hostname'] ?? '', $dev['ip'] ?? '', null, 'SNMP check matched: ' . $matched);
+        } else {
+            $this->logDetail('snmp_fail', $dev['hostname'] ?? '', $dev['ip'] ?? '', null,
+                'No SNMP check matched: ' . implode(', ', array_column($this->checksForDevice($dev), 'name')));
+        }
+        $this->progress++;
+        $this->flushStats(false);
+    }
+
+    /**
+     * Run a worker script once per payload, all at once, and hand every
+     * "CDS {json}" line to $onLine as soon as a worker prints it — so the run log
+     * and its progress move while the workers are still busy. Each worker is a
+     * fresh PHP process: no inherited DB connection, so the parent's socket survives.
+     */
+    private function runWorkers(string $worker, array $args, array $payloads, callable $onLine): void {
+        if (!file_exists($worker)) {
+            $this->logDetail('graph_error', '', '', null, 'Worker not found: ' . $worker);
+            return;
+        }
+
+        $cmd = cacti_escapeshellcmd(read_config_option('path_php_binary') ?: '/usr/bin/php') . ' ' . cacti_escapeshellarg($worker);
+        foreach ($args as $arg) {
+            $cmd .= ' ' . cacti_escapeshellarg($arg);
+        }
+
+        $procs = [];
+        foreach ($payloads as $payload) {
+            $proc = proc_open($cmd, [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['file', '/dev/null', 'a'],
+            ], $pipes);
+            if (!is_resource($proc)) continue;
+
+            fwrite($pipes[0], $payload);
+            fclose($pipes[0]);
+            stream_set_blocking($pipes[1], false);
+
+            $procs[(int)$pipes[1]] = ['proc' => $proc, 'out' => $pipes[1], 'buf' => ''];
+        }
+
+        while (cacti_sizeof($procs)) {
+            $read = array_column($procs, 'out');
+            $write = $except = null;
+            if (@stream_select($read, $write, $except, 5) === false) break;
+
+            foreach ($read as $out) {
+                $id    = (int)$out;
+                $chunk = fread($out, 65536);
+
+                if ($chunk !== false && $chunk !== '') {
+                    $procs[$id]['buf'] .= $chunk;
+                    while (($nl = strpos($procs[$id]['buf'], "\n")) !== false) {
+                        $text = substr($procs[$id]['buf'], 0, $nl);
+                        $procs[$id]['buf'] = substr($procs[$id]['buf'], $nl + 1);
+
+                        if (strpos($text, 'CDS ') !== 0) continue;
+                        $line = json_decode(substr($text, 4), true);
+                        if (is_array($line)) {
+                            $this->ensureDbConnection();
+                            $onLine($line);
+                        }
+                    }
+                }
+
+                if (feof($out)) {
+                    fclose($out);
+                    proc_close($procs[$id]['proc']);
+                    unset($procs[$id]);
+                }
             }
         }
 
-        return $results;
+        $this->flushStats();
     }
 
     private function ensureDbConnection(): void {
@@ -3008,12 +3099,23 @@ class CereusDatasyncEngine {
 
     // Write current stats to the DB without closing the run — allows the poll
     // endpoint to show live progress while the background process is still running.
-    private function flushStats(): void {
+    private function setPhase(string $phase, int $total = 0): void {
+        $this->phase      = $phase;
+        $this->progress   = 0;
+        $this->progressOf = $total;
+        $this->flushStats();
+    }
+
+    // $force = false: at most once a second, for per-item progress.
+    private function flushStats(bool $force = true): void {
         if (!$this->runId) return;
+        if (!$force && microtime(true) - $this->lastFlush < 1.0) return;
+        $this->lastFlush = microtime(true);
         $this->ensureDbConnection();
         db_execute_prepared(
             'UPDATE plugin_cds_runs
-             SET excel_total = ?, excel_raw_total = ?, excel_skipped_load = ?,
+             SET phase = ?, progress_done = ?, progress_total = ?,
+                 excel_total = ?, excel_raw_total = ?, excel_skipped_load = ?,
                  cacti_total = ?, added = ?, updated = ?,
                  marked_deleted = ?, skipped = ?, failed = ?,
                  tree_placed = ?, graphs_found = ?, graphs_created = ?,
@@ -3021,6 +3123,8 @@ class CereusDatasyncEngine {
                  sites_unmarked = ?, trees_unmarked = ?
              WHERE id = ?',
             [
+                substr($this->phase, 0, 64),        min($this->progress, $this->progressOf),
+                $this->progressOf,
                 $this->stats['excel_total'],        $this->stats['excel_raw_total'],
                 $this->stats['excel_skipped_load'],
                 $this->stats['cacti_total'],        $this->stats['added'],
@@ -3068,6 +3172,7 @@ class CereusDatasyncEngine {
         db_execute_prepared(
             'UPDATE plugin_cds_runs
              SET status = ?, completed_at = NOW(), error_message = ?,
+                 phase = "", progress_done = 0, progress_total = 0,
                  excel_total = ?, excel_raw_total = ?, excel_skipped_load = ?,
                  cacti_total = ?, added = ?, updated = ?,
                  marked_deleted = ?, skipped = ?, failed = ?,

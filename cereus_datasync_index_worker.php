@@ -3,7 +3,8 @@
 // Data query indexing worker — launched by SyncEngine via proc_open().
 // Runs each device's data queries once; run_data_query() then applies Cacti's
 // Graph Rules (and the tree rules for the graphs they create). Reads a JSON job
-// list from stdin, writes JSON results to stdout. Called as:
+// list from stdin and writes one "CDS {json}" line per device to stdout as soon
+// as it is done, so the run can show progress. Called as:
 //   php cereus_datasync_index_worker.php
 
 if (php_sapi_name() !== 'cli') { http_response_code(403); exit; }
@@ -32,14 +33,12 @@ $input  = json_decode(file_get_contents('php://stdin'), true);
 $jobs   = $input['jobs']   ?? [];
 $prefix = (string)($input['prefix'] ?? '');
 
-$results = [];
-
-// Anything Cacti prints while indexing would corrupt the JSON on stdout.
-ob_start();
-
 foreach ($jobs as $job) {
     $hostId = (int)($job['host_id'] ?? 0);
     if (!$hostId) continue;
+
+    // Anything Cacti prints while indexing would corrupt the lines on stdout.
+    ob_start();
 
     $result = ['graphs' => [], 'errors' => []];
     $before = (int)db_fetch_cell_prepared('SELECT COALESCE(MAX(id), 0) FROM graph_local WHERE host_id = ?', [$hostId]);
@@ -77,10 +76,11 @@ foreach ($jobs as $job) {
         }
     }
 
-    $result['graphs'] = $graphIds;
-    $results[$hostId] = $result;
+    $result['graphs']  = $graphIds;
+    $result['host_id'] = $hostId;
+
+    ob_end_clean();
+
+    echo 'CDS ' . json_encode($result) . "\n";
+    flush();
 }
-
-ob_end_clean();
-
-echo json_encode($results);

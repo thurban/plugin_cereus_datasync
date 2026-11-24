@@ -7,7 +7,7 @@ their graphs and files them into the graph tree by location.
 ![How Cereus Data Sync works](docs/images/workflow.svg)
 
 The numbered markers on the screenshots below match the numbered steps under each
-one. This guide covers version 1.12.0.
+one. This guide covers version 1.13.0.
 
 ---
 
@@ -167,6 +167,8 @@ the profile list. You can keep several — one per region or customer, for examp
    the graphs from the rules, and its tree rules place them. New devices get Cacti's
    default re-index method, so Cacti re-indexes them itself later (e.g. after a
    reboot) and the Graph Rules pick up new interfaces or IP SLA entries.
+   A Graph Rule's data query does not have to be in the host template: when the
+   rule's matching devices include the device, the data query is linked to it first.
    *Apply Rules* also runs the Graph Rules for devices already in Cacti, from the
    index data Cacti already holds — no SNMP. A data query is walked there only if the
    device was never indexed for it, and then only once.
@@ -203,6 +205,11 @@ To start a new profile from an existing one, use **Copy** in the profile list.
 **Dry** reports what would change, **Run** makes the changes. Both run in the
 background; the page stays usable and updates on its own.
 
+While a run is going, the run window and the run report show what it is doing
+now — e.g. *SNMP naming checks — 53 / 160* — and each SNMP check result appears in
+the log as soon as the device is checked. The run report reloads itself every few
+seconds and lists the newest events first until the run ends.
+
 ### Applying rules without an import
 
 **Apply Rules** runs only the rules, on what is already in Cacti — the inventory
@@ -214,7 +221,9 @@ rule, or when graphs got new titles.
 - Graphs that **already exist** and match a template are placed straight away.
 - Host rules, aggregate rules, OID rules and co-requisite groups are applied as well.
 - With *Run Graph Rules* on, Cacti's Graph Rules are run for every device, from the
-  index data Cacti already holds. Use this after adding a Graph Rule.
+  index data Cacti already holds. Use this after adding a Graph Rule. A Graph Rule's
+  data query is linked to the devices its matching devices include, and walked once
+  for each of them — the first *Apply Rules* after a new rule takes longer.
 - The run appears in the log as *(rules only)* and does not change the profile's
   *Last Run* or its schedule.
 

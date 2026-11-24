@@ -211,18 +211,25 @@ function cereus_datasync_list(): void {
         var cdsPoller      = null;
         var cdsReloadTimer = null;
 
-        function cdsStatsText(s, status, d) {
+        function cdsStatsText(s, status, d, p) {
             d = d || {};
+            p = p || {};
             var raw   = s.excel_raw_total    || 0;
             var valid = s.excel_total        || 0;
             var drop  = s.excel_skipped_load || 0;
             var excelLine = raw > 0
                 ? 'Excel rows     : ' + raw + ' raw → ' + valid + ' valid (' + drop + ' dropped)'
                 : 'Excel devices  : ' + valid;
-            var checkLine = (s.checking || 0) > 0
-                ? '\nChecking L2    : ' + s.checking + ' devices pending SNMP check…'
+            var nowLine = '';
+            if (p.phase) {
+                nowLine = 'Now            : ' + p.phase
+                    + (p.progress_total > 0 ? ' — ' + p.progress_done + ' / ' + p.progress_total
+                        + ' (' + Math.floor(100 * p.progress_done / p.progress_total) + '%)' : '…') + '\n';
+            }
+            var checkLine = ((d.snmp_pass || 0) + (d.snmp_fail || 0)) > 0
+                ? 'SNMP checks    : ' + (d.snmp_pass || 0) + ' passed, ' + (d.snmp_fail || 0) + ' no match\n'
                 : '';
-            return 'Status         : ' + status + '\n\n'
+            return 'Status         : ' + status + '\n' + nowLine + checkLine + '\n'
                 + excelLine + '\n'
                 + 'Cacti devices  : ' + (s.cacti_total    || 0) + '\n'
                 + 'Added          : ' + (s.added          || 0) + '\n'
@@ -237,8 +244,7 @@ function cereus_datasync_list(): void {
                 + 'Rules updated  : ' + (d.auto_rule_updated || 0) + '\n'
                 + 'Rules existing : ' + (d.auto_rule_exists  || 0) + '\n'
                 + 'Rules skipped  : ' + (d.auto_rule_skip    || 0) + '\n'
-                + 'Branches new   : ' + (d.branch_created    || 0)
-                + checkLine;
+                + 'Branches new   : ' + (d.branch_created    || 0);
         }
 
         function cdsPollRun(runId) {
@@ -251,7 +257,7 @@ function cereus_datasync_list(): void {
                     return;
                 }
                 var done = (data.status === 'completed' || data.status === 'failed');
-                $('#cds-modal-body').text(cdsStatsText(data.stats || {}, data.status, data.details));
+                $('#cds-modal-body').text(cdsStatsText(data.stats || {}, data.status, data.details, data));
                 if (done) {
                     clearInterval(cdsPoller);
                     cdsPoller = null;

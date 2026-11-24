@@ -157,7 +157,7 @@ function cereus_datasync_log_detail(int $runId): void {
 
     $total = (int)db_fetch_cell_prepared("SELECT COUNT(*) FROM plugin_cds_run_details $sql_where", $sql_params);
     $items = db_fetch_assoc_prepared(
-        "SELECT * FROM plugin_cds_run_details $sql_where ORDER BY id LIMIT " . (($page - 1) * $rows) . ", $rows",
+        "SELECT * FROM plugin_cds_run_details $sql_where ORDER BY id " . (in_array($run['status'], ['running', 'queued'], true) ? 'DESC' : '') . " LIMIT " . (($page - 1) * $rows) . ", $rows",
         $sql_params
     );
 
@@ -178,6 +178,8 @@ function cereus_datasync_log_detail(int $runId): void {
             [null,             'cacti_total',        __('Devices in Cacti', 'cereus_datasync'),    '#0f172a'],
         ]],
         'devices' => [__('Devices', 'cereus_datasync'), [
+            ['snmp_pass',      null,                 __('SNMP check passed', 'cereus_datasync'),   '#0d9488'],
+            ['snmp_fail',      null,                 __('SNMP check no match', 'cereus_datasync'), '#64748b'],
             ['added',          'added',              __('Added', 'cereus_datasync'),               '#15803d'],
             ['updated',        'updated',            __('Updated', 'cereus_datasync'),             '#2563eb'],
             ['marked_deleted', 'marked_deleted',     __('Marked for deletion', 'cereus_datasync'), '#d97706'],
@@ -186,6 +188,7 @@ function cereus_datasync_log_detail(int $runId): void {
         ]],
         'graphs' => [__('Graphs', 'cereus_datasync'), [
             [null,             'graphs_found',       __('SNMP check matches', 'cereus_datasync'), '#0369a1'],
+            ['dq_linked',      null,                 __('Data queries linked', 'cereus_datasync'), '#0369a1'],
             ['graph_created',  'graphs_created',     __('Graphs created', 'cereus_datasync'),      '#0891b2'],
             ['tree_placed',    'tree_placed',        __('Placed on a tree', 'cereus_datasync'),    '#7c3aed'],
             ['graph_skip',     null,                 __('Graphs skipped', 'cereus_datasync'),      '#475569'],
@@ -254,6 +257,22 @@ function cereus_datasync_log_detail(int $runId): void {
     print '<span style="color:#64748b;">' . html_escape($run['started_at']) . '</span>';
     print '<span style="padding:2px 10px;border-radius:12px;background:' . $sc . ';color:#fff;font-size:12px;font-weight:600;">' . strtoupper($run['status']) . ($run['dry_run'] ? ' · DRY' : '') . '</span>';
     if ($duration) print '<span style="color:#64748b;">&#9200; ' . $duration . '</span>';
+    if (in_array($run['status'], ['running', 'queued'], true)) {
+        // Live progress; the page reloads itself while the run is going.
+        $total = (int)($run['progress_total'] ?? 0);
+        $done  = min((int)($run['progress_done'] ?? 0), $total);
+        print '<span id="cds-run-live" style="display:inline-flex;align-items:center;gap:8px;color:#1e40af;">';
+        print html_escape(($run['phase'] ?? '') !== '' ? $run['phase'] : __('Working…', 'cereus_datasync'));
+        if ($total > 0) {
+            print ' <span style="display:inline-block;width:120px;height:8px;background:#dbeafe;border-radius:4px;overflow:hidden;">'
+                . '<span style="display:block;height:100%;width:' . floor(100 * $done / $total) . '%;background:#2563eb;"></span></span> '
+                . $done . ' / ' . $total;
+        }
+        print '</span>';
+        print '<script>setTimeout(function() { if ($("#cds-run-live").length) { loadPageNoHeader('
+            . json_encode('cereus_datasync_log.php?action=view&run_id=' . $runId . '&af=' . rawurlencode($actionFilter) . '&header=false')
+            . '); } }, 5000);</script>';
+    }
     if ($run['error_message']) {
         print '<span style="color:#dc2626;font-size:12px;">&#9888; ' . html_escape(substr($run['error_message'], 0, 120)) . '</span>';
     }
@@ -305,6 +324,9 @@ function cereus_datasync_log_detail(int $runId): void {
         'graph_skip'         => '#94a3b8',
         'graph_error'        => '#dc2626',
         'graph_created'      => '#0891b2',
+        'snmp_pass'          => '#0d9488',
+        'snmp_fail'          => '#64748b',
+        'dq_linked'          => '#0369a1',
         'auto_rule'          => '#7c3aed',
         'auto_rule_updated'  => '#2563eb',
         'auto_rule_exists'   => '#64748b',

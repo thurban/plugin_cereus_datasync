@@ -5,6 +5,25 @@ All notable changes to the Cereus Data Sync plugin are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-11-24
+
+### Added
+- **Live progress while a run is going.** The SNMP naming checks and the Graph
+  Rule indexing report each device as soon as a worker finishes it, instead of
+  all at once at the end. The run window shows what the run is doing now
+  ("SNMP naming checks — 53 / 160") and how many checks passed; the run report
+  shows the same with a progress bar, reloads itself, and lists the newest
+  events first until the run ends. Each check result is logged (*SNMP check
+  passed* / *SNMP check no match*).
+
+### Fixed
+- **Graph Rules for data queries the host template lacks.** 1.11.0 linked a
+  check's data query (e.g. IP SLA) to the device; 1.12.0 relied on the host
+  template, so such graphs were no longer created. The data query of every enabled
+  Graph Rule whose matching devices include the device is now linked, with Cacti's
+  default re-index method, and indexed once — for new devices on a sync, for
+  existing devices on *Apply Rules*. The run log lists each link.
+
 ## [1.12.0] - 2026-11-24
 
 ### Changed
